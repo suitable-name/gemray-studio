@@ -1,0 +1,17 @@
+[package]
+name = "lapidary"
+version = { workspace = true }
+edition = { workspace = true }
+rust-version = { workspace = true }
+authors = { workspace = true }
+description = "Readers and writers for gemstone faceting design file formats."
+license = { workspace = true }
+repository = { workspace = true }
+keywords = ["gemstone", "faceting", "gemcad", "parser", "cad"]
+categories = ["parser-implementations", "encoding"]
+publish = { workspace = true }
+
+[dependencies]
+
+[lints]
+workspace = true

@@ -1,0 +1,516 @@
+import { LineEdit, ComboBox, Button } from "std-widgets.slint";
+import { Theme } from "../theme.slint";
+import { FilterPanel } from "filter_panel.slint";
+import { ImportDialog } from "import_dialog.slint";
+import { RemoteWorkerDialog } from "remote_worker_dialog.slint";
+import { WorkerItem } from "../types.slint";
+
+export component HeaderToolbar inherits Rectangle {
+    in-out property <string> search_text <=> search_input.text;
+    in property <[string]> shape_options: ["All Shapes"];
+    in-out property <int> selected_shape_index: 0;
+    in property <[string]> gear_options: ["All Gears"];
+    in-out property <int> selected_gear_index: 0;
+    in property <bool> is_busy: false;
+    in property <string> status_message: "Database ready.";
+
+    // Range filter bounds (the actual min/max present in the catalogue -- drives
+    // slider scale) and current filter values, one pair per attribute. Forwarded
+    // straight through to `FilterPanel`; see its doc comment for the "value equals
+    // its bound edge means unfiltered" convention `gui/search.rs::read_range_filter`
+    // relies on.
+    in property <float> ri_bounds_min: 1.0;
+    in property <float> ri_bounds_max: 3.0;
+    in-out property <float> ri_filter_min: 1.0;
+    in-out property <float> ri_filter_max: 3.0;
+    in property <float> lw_bounds_min: 1.0;
+    in property <float> lw_bounds_max: 3.0;
+    in-out property <float> lw_filter_min: 1.0;
+    in-out property <float> lw_filter_max: 3.0;
+    in property <float> volume_bounds_min: 0.0;
+    in property <float> volume_bounds_max: 1.0;
+    in-out property <float> volume_filter_min: 0.0;
+    in-out property <float> volume_filter_max: 1.0;
+    in property <float> facets_bounds_min: 0.0;
+    in property <float> facets_bounds_max: 200.0;
+    in-out property <float> facets_filter_min: 0.0;
+    in-out property <float> facets_filter_max: 200.0;
+    in property <int> matched_count: 0;
+    in property <int> total_count: 0;
+    // Derived from the `filter_popup` PopupWindow's own `is-open`, not toggled
+    // directly -- see the `filter_popup` doc comment below for why.
+    property <bool> filters_open: filter_popup.is-open;
+
+    // Local-library import popup ("Import" button below) -- brings the user's own
+    // `.asc` file(s) into the catalogue. See `import_dialog.slint`'s doc comment.
+    in property <string> import_result_text: "";
+    in property <int> import_done: 0;
+    in property <int> import_total: 0;
+    in property <float> import_progress: 0.0;
+
+    // Remote rendering: the worker-list panel's state, hoisted here (not local to
+    // `RemoteWorkerDialog`, which is only instantiated while `remote_open` is true) so
+    // Rust can set it from a background "Test connection" thread without needing the
+    // panel to be open. See `remote_worker_dialog.slint`'s own doc comment.
+    in property <[WorkerItem]> remote_workers: [];
+    in property <bool> denoise_enabled: true;
+    // Remote render sample budget -- `in-out` (unlike `denoise_enabled` above)
+    // so the slider's own drag updates it two-way through this hop, the same treatment
+    // `app.slint`'s `target_samples_exponent` gives the local Target Samples slider.
+    in-out property <float> remote_render_samples_exponent: 9.0;
+    in property <int> testing_worker_index: -1;
+    in property <string> test_connection_result: "";
+    in property <int> test_connection_result_index: -1;
+    in property <bool> test_connection_is_error: false;
+    in property <bool> served_by_remote: false;
+    in property <string> served_by_worker_name: "";
+    // Token-based worker enrollment -- see `app.slint`'s own `claiming_token` doc
+    // comment (this just forwards the same properties one hop further, same treatment
+    // `testing_worker_index`/`test_connection_result*` above already get).
+    in property <bool> claiming_token: false;
+    in property <string> claim_result_text: "";
+    in property <int> claim_result_index: -1;
+    in property <bool> claim_result_is_error: false;
+    in property <string> claimed_cert_dir: "";
+    // Derived from the `remote_popup` PopupWindow's own `is-open`, not toggled
+    // directly -- see the `remote_popup` doc comment below for why.
+    property <bool> remote_open: remote_popup.is-open;
+
+    // Which library the viewer is currently browsing (see
+    // `bridge::library_source`) and pull-mirror sync progress (see
+    // `bridge::library_mirror`) -- both just forwarded one hop further to
+    // `RemoteWorkerDialog`; `library_source_label`/`library_is_remote` additionally
+    // drive the small badge below so switching away from local is always visible even
+    // with the worker panel closed.
+    in property <int> library_source_worker_index: -1;
+    in property <string> library_source_label: "Local library";
+    in property <bool> library_is_remote: false;
+    in property <int> mirror_worker_index: -1;
+    in property <bool> mirror_in_progress: false;
+    in property <float> mirror_progress_fraction: 0.0;
+    in property <string> mirror_status_text: "";
+    in property <bool> mirror_has_error: false;
+
+    callback search_changed(string);
+    callback filter_shape_changed(string);
+    callback filter_gear_changed(string);
+    // Pick-and-import in one step -- see `ImportDialog`'s own doc comment on
+    // `pick_asc_file`/`pick_asc_folder`. `pick_asc_folder` carries whether to recurse
+    // into subfolders (Task: FEATURE 3), decided by the dialog's own toggle.
+    callback pick_asc_file();
+    callback pick_asc_folder(bool);
+    // Native folder picker for `remote_popup`'s certificate-bundle-folder field.
+    callback pick_cert_dir(string) -> string;
+    callback clear_search();
+    // Fired whenever a range slider moves or Reset is pressed -- Rust re-reads every
+    // filter value off this component's properties and re-runs the catalogue query.
+    callback filters_changed();
+    callback denoise_toggled(bool);
+    // Carries the slider's EXPONENT, not the resolved sample count -- see
+    // `remote_render_samples_exponent`'s own doc comment.
+    callback remote_render_samples_changed(int);
+    callback test_worker_connection(int, string, string);
+    callback save_worker(int, WorkerItem);
+    callback remove_worker(int);
+    callback claim_token(int, string, string, string);
+    callback switch_library_source(int);
+    callback start_mirror_sync(int);
+    callback cancel_mirror_sync();
+
+    height: 64px;
+    background: Theme.bg-card;
+    border-radius: Theme.radius-md;
+    border-width: 1px;
+    border-color: Theme.border-subtle;
+
+    HorizontalLayout {
+        padding-left: 16px;
+        padding-right: 16px;
+        alignment: space-between;
+
+        // Logo & Title Area
+        HorizontalLayout {
+            spacing: 12px;
+            alignment: start;
+
+            Rectangle {
+                width: 36px;
+                height: 36px;
+                background: #1e3a8a;
+                border-radius: 8px;
+                border-width: 1px;
+                border-color: Theme.accent-cyan;
+
+                Image {
+                    source: @image-url("../icons/gem.svg");
+                    colorize: Theme.accent-cyan;
+                    width: 18px;
+                    height: 18px;
+                    horizontal-alignment: center;
+                }
+            }
+
+            VerticalLayout {
+                alignment: center;
+                spacing: 2px;
+
+                Text {
+                    text: "Facet Diagrams Studio";
+                    font-size: 15px;
+                    font-weight: 700;
+                    color: Theme.text-primary;
+                }
+
+                HorizontalLayout {
+                    spacing: 6px;
+                    Rectangle {
+                        width: 7px;
+                        height: 7px;
+                        border-radius: 3.5px;
+                        background: root.is_busy ? Theme.accent-amber : Theme.accent-emerald;
+                            }
+                    Text {
+                        text: root.status_message;
+                        font-size: 11px;
+                        color: root.is_busy ? Theme.accent-amber : Theme.text-muted;
+                        overflow: elide;
+                        max-width: 260px;
+                    }
+                }
+
+                // Always-visible "which library am I looking at" badge --
+                // deliberately shown here, next to the status line, not only inside the
+                // worker panel (`remote_popup`), so switching away from local is
+                // obvious even with that panel closed. See this component's own
+                // `library_source_label`/`library_is_remote` doc comment.
+                Rectangle {
+                    height: 20px;
+                    border-radius: 10px;
+                    background: root.library_is_remote ? #164e63 : Theme.bg-elevated;
+                    border-width: 1px;
+                    border-color: root.library_is_remote ? Theme.accent-cyan : Theme.border-subtle;
+                    HorizontalLayout {
+                        padding-left: 8px;
+                        padding-right: 8px;
+                        spacing: 4px;
+                        alignment: center;
+                        Rectangle {
+                            width: 6px;
+                            height: 6px;
+                            border-radius: 3px;
+                            background: root.library_is_remote ? Theme.accent-cyan : Theme.text-muted;
+                        }
+                        Text {
+                            text: root.library_source_label;
+                            font-size: 10px;
+                            font-weight: 600;
+                            color: root.library_is_remote ? Theme.accent-cyan : Theme.text-muted;
+                            vertical-alignment: center;
+                        }
+                    }
+                }
+            }
+        }
+
+        // Search & Filter Controls
+        HorizontalLayout {
+            spacing: 10px;
+            alignment: center;
+
+            // Search Bar with icon
+            Rectangle {
+                width: 260px;
+                height: 38px;
+                background: Theme.bg-input;
+                border-radius: Theme.radius-sm;
+                border-width: 1px;
+                border-color: Theme.border-subtle;
+
+                HorizontalLayout {
+                    padding-left: 8px;
+                    padding-right: 8px;
+                    spacing: 6px;
+                    alignment: center;
+
+                    Image {
+                        source: @image-url("../icons/search.svg");
+                        colorize: Theme.text-muted;
+                        width: 12px;
+                        height: 12px;
+                    }
+
+                    search_input := LineEdit {
+                        placeholder-text: "Search diagram, designer, notes... (Ctrl+F)";
+                        edited => { root.search_changed(self.text); }
+                    }
+
+                    if root.search_text != "": Rectangle {
+                        width: 20px;
+                        height: 20px;
+                        border-radius: 10px;
+                        background: Theme.bg-elevated;
+        
+                        TouchArea {
+                            clicked => {
+                                search_input.text = "";
+                                root.search_changed("");
+                                root.clear_search();
+                            }
+                        }
+
+                        Text {
+                            text: "×";
+                            font-size: 14px;
+                            color: Theme.text-secondary;
+                            horizontal-alignment: center;
+                            vertical-alignment: center;
+                        }
+                    }
+                }
+            }
+
+            // Shape Selector
+            Rectangle {
+                width: 160px;
+                height: 38px;
+
+                ComboBox {
+                    model: root.shape_options;
+                    current-index <=> root.selected_shape_index;
+                    selected(val) => { root.filter_shape_changed(val); }
+                }
+            }
+
+            // Gear Selector
+            Rectangle {
+                width: 130px;
+                height: 38px;
+
+                ComboBox {
+                    model: root.gear_options;
+                    current-index <=> root.selected_gear_index;
+                    selected(val) => { root.filter_gear_changed(val); }
+                }
+            }
+
+            // Advanced Range Filters Toggle
+            Rectangle {
+                width: 84px;
+                height: 38px;
+                background: root.filters_open ? Theme.accent-cyan : (filters_touch.has-hover ? Theme.bg-elevated : Theme.bg-input);
+                border-radius: Theme.radius-sm;
+                border-width: 1px;
+                border-color: root.filters_open ? Theme.accent-cyan : (root.filters_active ? Theme.accent-amber : Theme.border-subtle);
+
+                filters_touch := TouchArea {
+                    clicked => {
+                        if (filter_popup.is-open) {
+                            filter_popup.close();
+                        } else {
+                            filter_popup.show();
+                        }
+                    }
+                }
+
+                HorizontalLayout {
+                    spacing: 5px;
+                    alignment: center;
+                    Image {
+                        source: @image-url("../icons/ruler.svg");
+                        colorize: root.filters_open ? #0f172a : (root.filters_active ? Theme.accent-amber : Theme.text-secondary);
+                        width: 12px;
+                        height: 12px;
+                        vertical-alignment: center;
+                    }
+                    Text {
+                        text: "Filters";
+                        font-size: 12px;
+                        font-weight: 600;
+                        color: root.filters_open ? #0f172a : (root.filters_active ? Theme.accent-amber : Theme.text-secondary);
+                        vertical-alignment: center;
+                    }
+                    if root.filters_active: Rectangle {
+                        width: 6px;
+                        height: 6px;
+                        border-radius: 3px;
+                        background: root.filters_open ? #0f172a : Theme.accent-amber;
+                    }
+                }
+            }
+
+            // Import your own `.asc` file(s) into the local library.
+            Button {
+                text: "Import";
+                icon: @image-url("../icons/folder.svg");
+                colorize-icon: true;
+                height: 38px;
+                clicked => {
+                    if (import_popup.is-open) {
+                        import_popup.close();
+                    } else {
+                        import_popup.show();
+                    }
+                }
+            }
+
+            // Remote rendering: opens the worker-list panel.
+            Button {
+                text: "Remote";
+                icon: @image-url("../icons/gem.svg");
+                colorize-icon: true;
+                height: 38px;
+                clicked => {
+                    if (remote_popup.is-open) {
+                        remote_popup.close();
+                    } else {
+                        remote_popup.show();
+                    }
+                }
+            }
+        }
+    }
+
+    // True once any range slider has moved off its data-bounds edge -- see
+    // `gui/search.rs::active_bound` for the matching Rust-side check that decides
+    // which bounds actually reach the SQL query. Purely cosmetic here (lights up the
+    // Filters button so a closed panel doesn't hide an active filter from the user).
+    property <bool> filters_active: Math.abs(root.ri_filter_min - root.ri_bounds_min) > 0.0001
+        || Math.abs(root.ri_filter_max - root.ri_bounds_max) > 0.0001
+        || Math.abs(root.lw_filter_min - root.lw_bounds_min) > 0.0001
+        || Math.abs(root.lw_filter_max - root.lw_bounds_max) > 0.0001
+        || Math.abs(root.volume_filter_min - root.volume_bounds_min) > 0.0001
+        || Math.abs(root.volume_filter_max - root.volume_bounds_max) > 0.0001
+        || Math.abs(root.facets_filter_min - root.facets_bounds_min) > 0.0001
+        || Math.abs(root.facets_filter_max - root.facets_bounds_max) > 0.0001;
+
+    // --- MODAL BACKDROP FOR THE FILTER PANEL ---
+    if root.filters_open: Rectangle {
+        width: 100%;
+        height: 100%;
+        background: #00000055;
+        z: 150;
+
+        TouchArea {
+            clicked => { filter_popup.close(); }
+        }
+    }
+
+    // --- FLOATING FILTER PANEL ---
+    // A real `PopupWindow` (see `filter_panel.slint`'s doc comment): it must be
+    // instantiated unconditionally and shown/hidden via show()/close() rather than
+    // wrapped in `if filters_open: ... {}` -- a `PopupWindow` can't be conditional.
+    // Because it renders in Slint's dedicated popup layer instead of as a normal
+    // sibling, it always paints above the rest of the window, including the
+    // "Select a diagram from catalog" detail panel that used to occlude it.
+    filter_popup := FilterPanel {
+        x: parent.width - self.width - 16px;
+        y: root.height + 6px;
+
+        ri_bounds_min: root.ri_bounds_min;
+        ri_bounds_max: root.ri_bounds_max;
+        ri_filter_min <=> root.ri_filter_min;
+        ri_filter_max <=> root.ri_filter_max;
+        lw_bounds_min: root.lw_bounds_min;
+        lw_bounds_max: root.lw_bounds_max;
+        lw_filter_min <=> root.lw_filter_min;
+        lw_filter_max <=> root.lw_filter_max;
+        volume_bounds_min: root.volume_bounds_min;
+        volume_bounds_max: root.volume_bounds_max;
+        volume_filter_min <=> root.volume_filter_min;
+        volume_filter_max <=> root.volume_filter_max;
+        facets_bounds_min: root.facets_bounds_min;
+        facets_bounds_max: root.facets_bounds_max;
+        facets_filter_min <=> root.facets_filter_min;
+        facets_filter_max <=> root.facets_filter_max;
+        matched_count: root.matched_count;
+        total_count: root.total_count;
+
+        changed => { root.filters_changed(); }
+        reset => {
+            root.ri_filter_min = root.ri_bounds_min;
+            root.ri_filter_max = root.ri_bounds_max;
+            root.lw_filter_min = root.lw_bounds_min;
+            root.lw_filter_max = root.lw_bounds_max;
+            root.volume_filter_min = root.volume_bounds_min;
+            root.volume_filter_max = root.volume_bounds_max;
+            root.facets_filter_min = root.facets_bounds_min;
+            root.facets_filter_max = root.facets_bounds_max;
+            root.filters_changed();
+        }
+    }
+
+    // --- FLOATING IMPORT POPUP ---
+    // A real `PopupWindow` (see `import_dialog.slint`'s doc comment, same reasoning as
+    // `filter_popup` above): instantiated unconditionally, shown/hidden via
+    // show()/close().
+    import_popup := ImportDialog {
+        x: parent.width - self.width - 16px;
+        y: root.height + 6px;
+
+        result_text: root.import_result_text;
+        importing: root.is_busy;
+        import_done: root.import_done;
+        import_total: root.import_total;
+        import_progress: root.import_progress;
+
+        pick_asc_file => { root.pick_asc_file(); }
+        pick_asc_folder(recurse) => { root.pick_asc_folder(recurse); }
+    }
+
+    // --- MODAL BACKDROP FOR THE REMOTE-WORKERS POPUP ---
+    if root.remote_open: Rectangle {
+        width: 100%;
+        height: 100%;
+        background: #00000055;
+        z: 150;
+
+        TouchArea {
+            clicked => { remote_popup.close(); }
+        }
+    }
+
+    // --- FLOATING REMOTE-WORKERS POPUP ---
+    // A real `PopupWindow` (see `remote_worker_dialog.slint`'s doc comment, same
+    // reasoning as `filter_popup` above): it must be instantiated unconditionally and
+    // shown/hidden via show()/close() rather than wrapped in `if remote_open: ... {}`
+    // -- a `PopupWindow` can't be conditional. Because it renders in Slint's dedicated
+    // popup layer instead of as a normal sibling, it always paints above the rest of
+    // the window, including the "Select a diagram from catalog" detail panel that used
+    // to occlude it.
+    remote_popup := RemoteWorkerDialog {
+        x: parent.width - self.width - 16px;
+        y: root.height + 6px;
+
+        workers: root.remote_workers;
+        denoise_enabled: root.denoise_enabled;
+        remote_render_samples_exponent <=> root.remote_render_samples_exponent;
+        testing_index: root.testing_worker_index;
+        test_result_text: root.test_connection_result;
+        test_result_index: root.test_connection_result_index;
+        test_result_is_error: root.test_connection_is_error;
+        served_by_remote: root.served_by_remote;
+        served_by_worker_name: root.served_by_worker_name;
+        claiming_token: root.claiming_token;
+        claim_result_text: root.claim_result_text;
+        claim_result_index: root.claim_result_index;
+        claim_result_is_error: root.claim_result_is_error;
+        claimed_cert_dir: root.claimed_cert_dir;
+        library_source_worker_index: root.library_source_worker_index;
+        mirror_worker_index: root.mirror_worker_index;
+        mirror_in_progress: root.mirror_in_progress;
+        mirror_progress_fraction: root.mirror_progress_fraction;
+        mirror_status_text: root.mirror_status_text;
+        mirror_has_error: root.mirror_has_error;
+
+        denoise_toggled(enabled) => { root.denoise_toggled(enabled); }
+        remote_render_samples_changed(exp) => { root.remote_render_samples_changed(exp); }
+        test_connection(idx, address, cert_dir) => { root.test_worker_connection(idx, address, cert_dir); }
+        save_worker(idx, worker) => { root.save_worker(idx, worker); }
+        remove_worker(idx) => { root.remove_worker(idx); }
+        claim_token(idx, name, addr, token) => { root.claim_token(idx, name, addr, token); }
+        switch_library_source(idx) => { root.switch_library_source(idx); }
+        start_mirror_sync(idx) => { root.start_mirror_sync(idx); }
+        cancel_mirror_sync => { root.cancel_mirror_sync(); }
+        pick_cert_dir(cur) => { root.pick_cert_dir(cur) }
+    }
+}

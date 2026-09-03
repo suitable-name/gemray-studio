@@ -1,0 +1,179 @@
+import { ScrollView } from "std-widgets.slint";
+import { DiagramItem } from "../types.slint";
+import { Theme } from "../theme.slint";
+
+export component DiagramListView inherits Rectangle {
+    in property <[DiagramItem]> diagram_list: [];
+    in property <int> total_count: 0;
+    in property <int> selected_entry_id: -1;
+
+    callback select_diagram(int);
+    callback context_menu_requested(int, length, length); // id, mouse_x, mouse_y
+
+    min-width: 260px;
+    max-width: 440px;
+    preferred-width: 340px;
+    horizontal-stretch: 0;
+    background: Theme.bg-card;
+    border-radius: Theme.radius-md;
+    border-width: 1px;
+    border-color: Theme.border-subtle;
+
+    VerticalLayout {
+        padding: 10px;
+        spacing: 8px;
+
+        // List Header with counters
+        HorizontalLayout {
+            padding-left: 4px;
+            padding-right: 4px;
+            alignment: space-between;
+
+            Text {
+                text: "Catalog (" + root.diagram_list.length + " of " + root.total_count + ")";
+                font-size: 12px;
+                font-weight: 700;
+                color: Theme.text-primary;
+            }
+
+            if root.diagram_list.length == 0: Text {
+                text: "No matches";
+                font-size: 11px;
+                color: Theme.accent-amber;
+            }
+        }
+
+        // Empty state when search yields 0 items
+        if root.diagram_list.length == 0: Rectangle {
+            vertical-stretch: 1;
+            VerticalLayout {
+                alignment: center;
+                spacing: 8px;
+
+                Image {
+                    source: @image-url("../icons/search.svg");
+                    colorize: Theme.text-secondary;
+                    width: 28px;
+                    height: 28px;
+                    horizontal-alignment: center;
+                }
+
+                Text {
+                    text: "No diagrams found";
+                    font-size: 13px;
+                    font-weight: 600;
+                    color: Theme.text-secondary;
+                    horizontal-alignment: center;
+                }
+
+                Text {
+                    text: "Try adjusting your search terms or filters";
+                    font-size: 11px;
+                    color: Theme.text-muted;
+                    horizontal-alignment: center;
+                }
+            }
+        }
+
+        // Diagram Cards List
+        if root.diagram_list.length > 0: ScrollView {
+            VerticalLayout {
+                // Pack the cards at their own preferred heights and leave any leftover
+                // space empty. Without this, a `VerticalLayout` distributes surplus
+                // height across its children, and a `card` has no height of its own
+                // (it is sized by its content), so a short result list -- a narrow
+                // search, or the tail of a long one -- rendered its last few cards
+                // stretched tall with the text floating in the middle of them.
+                alignment: start;
+                spacing: 6px;
+
+                for item in root.diagram_list: card := Rectangle {
+                    background: root.selected_entry_id == item.id ? #1e3a8a : (item_touch.has-hover ? Theme.bg-card-hover : Theme.bg-input);
+                    border-radius: Theme.radius-sm;
+                    border-width: 1px;
+                    border-color: root.selected_entry_id == item.id ? Theme.accent-cyan : (item_touch.has-hover ? Theme.border-medium : transparent);
+
+                    item_touch := TouchArea {
+                        clicked => {
+                            root.select_diagram(item.id);
+                        }
+                    }
+
+                    VerticalLayout {
+                        padding: 10px;
+                        spacing: 6px;
+
+                        // Title & Shape Badge
+                        HorizontalLayout {
+                            alignment: space-between;
+                            spacing: 8px;
+
+                            Text {
+                                text: item.title;
+                                font-size: 13px;
+                                font-weight: 600;
+                                color: Theme.text-primary;
+                                overflow: elide;
+                                max-width: 220px;
+                            }
+
+                            if item.shape != "": Rectangle {
+                                background: #2563eb;
+                                border-radius: 3px;
+                                height: 18px;
+                                HorizontalLayout {
+                                    padding-left: 5px;
+                                    padding-right: 5px;
+                                    Text {
+                                        text: item.shape;
+                                        font-size: 10px;
+                                        font-weight: 600;
+                                        color: #eff6ff;
+                                        vertical-alignment: center;
+                                    }
+                                }
+                            }
+                        }
+
+                        // Designer & Specs row
+                        HorizontalLayout {
+                            alignment: space-between;
+
+                            Text {
+                                text: item.designer != "" ? item.designer : "Unknown Designer";
+                                font-size: 11px;
+                                color: Theme.text-muted;
+                                overflow: elide;
+                                max-width: 160px;
+                            }
+
+                            HorizontalLayout {
+                                spacing: 8px;
+                                if item.gear != "": HorizontalLayout {
+                                    spacing: 3px;
+                                    Image { source: @image-url("../icons/gear.svg"); colorize: Theme.accent-cyan; width: 9px; height: 9px; vertical-alignment: center; }
+                                    Text {
+                                        text: item.gear;
+                                        font-size: 10px;
+                                        color: Theme.accent-cyan;
+                                        vertical-alignment: center;
+                                    }
+                                }
+                                if item.facets != "": HorizontalLayout {
+                                    spacing: 3px;
+                                    Image { source: @image-url("../icons/diamond.svg"); colorize: Theme.accent-amber; width: 9px; height: 9px; vertical-alignment: center; }
+                                    Text {
+                                        text: item.facets;
+                                        font-size: 10px;
+                                        color: Theme.accent-amber;
+                                        vertical-alignment: center;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}

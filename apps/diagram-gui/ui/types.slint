@@ -1,0 +1,99 @@
+export struct DiagramItem {
+    id: int,
+    title: string,
+    shape: string,
+    gear: string,
+    facets: string,
+    designer: string,
+    lw_ratio: string,
+    ri: string,
+}
+
+export struct AngleItem {
+    order_idx: int,
+    facet: string,
+    angle: string,
+    index_val: string,
+    notes: string,
+}
+
+export struct FileItem {
+    name: string,
+    url: string,
+    size_str: string,
+}
+
+export struct OpticalMetricsData {
+    brilliance_pct: float,
+    fire_index: float,
+    windowing_pct: float,
+    extinction_pct: float,
+    scintillation: float,
+    render_time_ms: float,
+    accumulated_samples: int,
+}
+
+// Named lighting presets: only what the row UI needs to display and reference
+// a preset -- the full numeric payload (light yaw/pitch, exposure, rig, camera
+// distance) lives in Rust's `settings::LightingPreset` and is applied/captured there;
+// Slint just needs the name (to render/edit) and whether it's a built-in (to hide the
+// rename/delete affordances, which `SettingsFile::rename_preset`/`delete_preset`
+// refuse to act on anyway).
+export struct LightingPresetItem {
+    name: string,
+    built_in: bool,
+}
+
+// Remote rendering: one row in the worker-list panel. Rust owns the real
+// `settings::WorkerSettings` (address, cert bundle directory, transfer mode, cadence,
+// preview scale) -- this is just enough to render/edit a row and round-trip an edit
+// back to Rust by list index, mirroring `LightingPresetItem`'s own "index is identity"
+// convention.
+export struct WorkerItem {
+    name: string,
+    address: string,
+    cert_dir: string,
+    // 0 = LiveProgressive, 1 = FinalOnly -- matches `gemray_net::messages::TransferMode`.
+    transfer_mode_index: int,
+    cadence_ms: int,
+    // 0 = Full, 1 = Half, 2 = Quarter, 3 = Custom -- matches `settings::PreviewScale`.
+    preview_scale_index: int,
+    // Only meaningful when preview_scale_index == 3.
+    preview_scale_percent: int,
+}
+
+export struct DiagramDetailData {
+    id: int,
+    title: string,
+    url: string,
+    designer: string,
+    shape: string,
+    gear: string,
+    facets: string,
+    lw_ratio: string,
+    ri: string,
+    volume: string,
+    competition: string,
+    image_name: string,
+    has_image: bool,
+    // Whether `url` is a synthetic `local://...` id from a locally-imported design
+    // (see `diagram_catalog::local::import_asc`) rather than a real page on the web --
+    // gates the "Open on Web"/"Copy Link" affordances in `detail_header.slint`.
+    is_local: bool,
+    // Proportions `apply_measured_metadata` derives alongside `lw_ratio`/`volume`
+    // above but that used to go nowhere in the UI at all -- shown in the same metric
+    // grid, formatted to 3 decimal places the same way (see `gui::detail`'s
+    // `format_proportion`). Empty string, same as the other optional chips above,
+    // means "not known for this design" and hides the chip entirely.
+    hw_ratio: string,
+    cw_ratio: string,
+    pw_ratio: string,
+    // Metadata-editor-only fields (see `metadata_editor_dialog.slint`): not shown as
+    // their own chips here, only pre-filled into the edit form. `symmetry_order` is
+    // kept as a display string (matching every other numeric field on this struct,
+    // all of which are free-text on their own storage column) rather than an int,
+    // since it's `None`-able and this struct otherwise never plumbs an "unknown"
+    // sentinel through an `int` field.
+    symmetry_order: string,
+    mirror_symmetry: bool,
+}

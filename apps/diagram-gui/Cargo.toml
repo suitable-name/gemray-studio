@@ -1,0 +1,101 @@
+[package]
+name = "diagram-gui"
+version = { workspace = true }
+edition = { workspace = true }
+rust-version = { workspace = true }
+authors = { workspace = true }
+description = "Desktop application for browsing, searching, and spectrally rendering gemstone faceting designs."
+license = { workspace = true }
+repository = { workspace = true }
+keywords = ["gemstone", "faceting", "gui", "slint", "rendering"]
+categories = ["gui", "graphics", "rendering"]
+publish = { workspace = true }
+
+[lib]
+name = "diagram_gui"
+path = "src/lib.rs"
+
+[[bin]]
+name = "diagram-gui"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = { workspace = true }
+bytemuck = { workspace = true }
+diagram-catalog = { workspace = true }
+# `hdr` (Radiance `.hdr` decoding, for `EnvironmentMap::from_hdr_file`) is enabled
+# unconditionally rather than behind a feature of this crate's own. It was briefly a
+# feature, but `bridge::render_thread::load_env_map` calls `from_hdr_file` with no
+# `#[cfg]`, so `--no-default-features` did not compile -- a feature that cannot be
+# switched off is a lie in the manifest. It is also genuinely cheap: `image` is already
+# a direct dependency below with `features = ["png"]`, and cargo unifies the two feature
+# lists into one build, so this adds a format decoder rather than a dependency tree.
+# Contrast `gpu` below, which stays opt-in because `wgpu`/`pollster` really is one.
+gemray = { workspace = true, features = ["hdr"] }
+# Remote rendering (Task: remote rendering) -- the client protocol driver
+# (`gemray_net::client`), settings model types (`TransferMode`/`StreamConfig`/
+# `PreviewConfig`), and mutual-TLS config building (`gemray_net::tls`).
+# `render` is not optional for this crate: the viewer IS a render client -- it builds a
+# `SceneState`, sends a `RenderRequest`, and reads the stream back. That feature exists
+# so a LIBRARY-ONLY `gemray-worker` can avoid compiling `gemray` at all; a viewer that
+# renders has no such option and would fail to compile without it.
+gemray-net = { workspace = true, features = ["render"] }
+glam = { workspace = true }
+image = { workspace = true, features = ["png"] }
+# Local import ("Import" button) and export ("Export .asc" -- see `gui::library`) of
+# the user's own `.asc` files.
+lapidary = { workspace = true }
+postcard = { workspace = true }
+# Native OS file/folder picker dialogs for every path input in this crate's GUI
+# (import .asc, HDR environment map, remote-worker cert-dir, high-res PNG export, and
+# attachment export -- see each call site's own comment). Used via the blocking
+# `rfd::FileDialog` API, called synchronously from Slint callbacks on the UI/event-loop
+# thread: rfd's own docs give no threading caveat for that (the only thread guidance
+# they give is macOS-specific, recommending -- not requiring -- the main thread), and
+# on Windows this pops the native `IFileDialog` modal, which pumps its own message loop
+# while blocked on it, same as any other native Win32 modal dialog. `AsyncFileDialog` +
+# `slint::spawn_local` was the alternative; not used since nothing here needs the UI
+# thread free while the dialog is up, and this app has no existing `spawn_local`
+# convention to fold into.
+rfd = { workspace = true }
+# Remote rendering (Task: remote rendering) -- `bridge::remote_render` owns the actual
+# mutual-TLS `TcpStream` to a configured worker (`rustls::ClientConnection`/
+# `StreamOwned`, built from `gemray_net::tls::client_config`) and postcard-decodes
+# `StreamEvent` headers itself so it can apply a short read timeout between frames --
+# see that module's doc comment for why (interleaving a `CANCEL` write without a
+# second thread touching the same TLS connection).
+rustls = { workspace = true }
+serde = { workspace = true }
+slint = { workspace = true }
+# Settings-persistence-only dependency (Task: settings persistence). Not added to
+# `[workspace.dependencies]` -- deliberately scoped to this crate alone, per the
+# instruction to touch only `apps/diagram-gui/Cargo.toml`.
+toml = "1.1.4"
+tracing = { workspace = true }
+
+[features]
+default = []
+# Routes the viewport's progressive accumulation through `gemray`'s verified GPU
+# megakernel (`gemray::renderer::gpu::frame`), falling back to the CPU tracer per frame
+# whenever the GPU declines -- no adapter on this machine, or a scene the megakernel has
+# no `env_mode` for. Off by default: the CPU path is the reference implementation and
+# needs no `wgpu`/`pollster` dependency tree, so an ordinary build stays exactly as lean
+# as it was. See `bridge::render_thread::GpuBackend`.
+gpu = ["gemray/gpu"]
+
+[build-dependencies]
+slint-build = { workspace = true }
+
+[dev-dependencies]
+# Test-only: `bridge::library_mirror`'s tests build a deterministic stand-in for the
+# real server-side content hash (`apps/gemray-worker/src/serve/library/mod.rs`'s own
+# `hash_summary`/`hash_record`) so a scripted `FakeTransport` can produce
+# `DesignSummary`/`DesignRecord` version hashes that change exactly when a test wants
+# them to -- see that module's `tests::content_hash`.
+sha2 = { workspace = true }
+
+[lints]
+workspace = true
+
+[target.'cfg(windows)'.build-dependencies]
+winresource = { workspace = true }

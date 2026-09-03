@@ -1,0 +1,226 @@
+import { Slider, Button } from "std-widgets.slint";
+import { Theme } from "../theme.slint";
+
+// One attribute's min/max range control: a label + current "min – max" readout above
+// two stacked sliders (Slint has no built-in dual-handle slider, so two single-handle
+// ones -- following the existing single-value-slider convention from
+// `material_editor_dialog.slint`/`settings_dialog.slint`). Each slider's own `minimum`/
+// `maximum` is the *data* bound, so its whole travel communicates the real range
+// present in the catalogue rather than an arbitrary fixed scale. Dragging one handle
+// past the other pushes the other along, so `value_min` can never exceed `value_max`.
+component RangeRow inherits VerticalLayout {
+    in property <string> label: "";
+    in property <image> icon;
+    in property <color> accent: Theme.accent-cyan;
+    in property <float> bound_min: 0.0;
+    in property <float> bound_max: 1.0;
+    in-out property <float> value_min: 0.0;
+    in-out property <float> value_max: 1.0;
+    // Facet counts display as whole numbers; every other attribute rounds to 2dp.
+    in property <bool> is_integer: false;
+    callback changed();
+
+    spacing: 5px;
+
+    HorizontalLayout {
+        spacing: 6px;
+        alignment: space-between;
+
+        HorizontalLayout {
+            spacing: 5px;
+            Image { source: root.icon; colorize: root.accent; width: 11px; height: 11px; vertical-alignment: center; }
+            Text { text: root.label; font-size: 11px; font-weight: 600; color: Theme.text-muted; vertical-alignment: center; }
+        }
+
+        Text {
+            text: (root.is_integer ? Math.round(root.value_min) : Math.round(root.value_min * 100) / 100)
+                + " – "
+                + (root.is_integer ? Math.round(root.value_max) : Math.round(root.value_max * 100) / 100);
+            font-size: 11px;
+            font-weight: 700;
+            color: root.accent;
+        }
+    }
+
+    Slider {
+        minimum: root.bound_min;
+        maximum: root.bound_max;
+        value <=> root.value_min;
+        changed(v) => {
+            if v > root.value_max {
+                root.value_max = v;
+            }
+            root.changed();
+        }
+    }
+    Slider {
+        minimum: root.bound_min;
+        maximum: root.bound_max;
+        value <=> root.value_max;
+        changed(v) => {
+            if v < root.value_min {
+                root.value_min = v;
+            }
+            root.changed();
+        }
+    }
+}
+
+// Floating filter panel. Inherits `PopupWindow`, not `Rectangle`: a `PopupWindow`
+// renders in Slint's dedicated popup layer, always on top of the rest of the window
+// regardless of sibling declaration order, and (like every popup/dialog card in this
+// app) needs an explicit content-driven `height` since plain `Rectangle`s default to
+// filling their parent's size when no height is set. See `header.slint`'s
+// `filter_popup` instantiation for the show()/close() wiring this requires -- a
+// `PopupWindow` can't be used with the `if condition: FilterPanel { ... }` pattern
+// that used to sit there (that's a compile error: "PopupWindow cannot be directly
+// repeated or conditional").
+export component FilterPanel inherits PopupWindow {
+    in property <float> ri_bounds_min: 1.0;
+    in property <float> ri_bounds_max: 3.0;
+    in-out property <float> ri_filter_min: 1.0;
+    in-out property <float> ri_filter_max: 3.0;
+    in property <float> lw_bounds_min: 1.0;
+    in property <float> lw_bounds_max: 3.0;
+    in-out property <float> lw_filter_min: 1.0;
+    in-out property <float> lw_filter_max: 3.0;
+    in property <float> volume_bounds_min: 0.0;
+    in property <float> volume_bounds_max: 1.0;
+    in-out property <float> volume_filter_min: 0.0;
+    in-out property <float> volume_filter_max: 1.0;
+    in property <float> facets_bounds_min: 0.0;
+    in property <float> facets_bounds_max: 200.0;
+    in-out property <float> facets_filter_min: 0.0;
+    in-out property <float> facets_filter_max: 200.0;
+    // How many catalogue rows currently match every active filter (search text, shape,
+    // gear, and these ranges) versus how many exist in total -- so narrowing a slider
+    // too far is visible right where the user is dragging it, not just back in the list.
+    in property <int> matched_count: 0;
+    in property <int> total_count: 0;
+
+    // The default `close-policy` (`close-on-click`) would close the popup on the very
+    // first click anywhere inside it -- including a drag on one of the sliders below or
+    // a press on the Reset button -- before that click could reach the control itself.
+    // `datepicker.slint`/`time-picker.slint` (Slint's own widgets, also popups full of
+    // interactive controls) make the same choice for the same reason. Closing is
+    // handled explicitly instead: the '×' button below calls the inherited `close()`,
+    // and `header.slint`'s backdrop click handler calls it too.
+    close-policy: PopupClosePolicy.no-auto-close;
+
+    // Fired on every slider drag tick, same as the existing exposure/light sliders in
+    // `settings_dialog.slint` -- Rust re-reads all eight values and re-runs the query.
+    callback changed();
+    // "Filters that cannot be cleared are a trap": jumps every slider back to its full
+    // data bound in one action, which also makes the query behave as if unfiltered
+    // (see `gui/search.rs::active_bound`).
+    callback reset();
+
+    width: 360px;
+    // Content-driven height: matches whatever `content` (the padded VerticalLayout
+    // below) actually needs, instead of defaulting to the height of whatever this
+    // popup happens to be anchored to.
+    height: content.preferred-height;
+
+    Rectangle {
+        background: #111827ee;
+        border-radius: Theme.radius-md;
+        border-width: 1px;
+        border-color: #334155;
+        drop-shadow-blur: 24px;
+        drop-shadow-color: #000000ee;
+        drop-shadow-offset-y: 6px;
+
+        content := VerticalLayout {
+        padding: 16px;
+        spacing: 14px;
+
+        // Header with Title and Close '×' button
+        HorizontalLayout {
+            alignment: space-between;
+
+            HorizontalLayout {
+                spacing: 8px;
+                Image { source: @image-url("../icons/ruler.svg"); colorize: Theme.accent-cyan; width: 15px; height: 15px; vertical-alignment: center; }
+                Text { text: "Advanced Filters"; font-size: 13px; font-weight: 700; color: Theme.text-primary; vertical-alignment: center; }
+            }
+
+            Rectangle {
+                width: 24px;
+                height: 24px;
+                border-radius: 12px;
+                background: close_btn.has-hover ? #1e293b : transparent;
+
+                close_btn := TouchArea {
+                    clicked => { root.close(); }
+                }
+
+                Text {
+                    text: "×";
+                    font-size: 16px;
+                    color: Theme.text-secondary;
+                    horizontal-alignment: center;
+                    vertical-alignment: center;
+                }
+            }
+        }
+
+        Text {
+            text: root.matched_count + " of " + root.total_count + " designs match";
+            font-size: 11px;
+            color: root.matched_count == 0 ? Theme.accent-ruby : Theme.text-muted;
+        }
+
+        RangeRow {
+            label: "Refractive Index";
+            icon: @image-url("../icons/gem.svg");
+            accent: Theme.accent-cyan;
+            bound_min: root.ri_bounds_min;
+            bound_max: root.ri_bounds_max;
+            value_min <=> root.ri_filter_min;
+            value_max <=> root.ri_filter_max;
+            changed => { root.changed(); }
+        }
+
+        RangeRow {
+            label: "L/W Ratio";
+            icon: @image-url("../icons/ruler.svg");
+            accent: Theme.accent-purple;
+            bound_min: root.lw_bounds_min;
+            bound_max: root.lw_bounds_max;
+            value_min <=> root.lw_filter_min;
+            value_max <=> root.lw_filter_max;
+            changed => { root.changed(); }
+        }
+
+        RangeRow {
+            label: "Volume (vol/w³)";
+            icon: @image-url("../icons/bar-chart.svg");
+            accent: Theme.accent-emerald;
+            bound_min: root.volume_bounds_min;
+            bound_max: root.volume_bounds_max;
+            value_min <=> root.volume_filter_min;
+            value_max <=> root.volume_filter_max;
+            changed => { root.changed(); }
+        }
+
+        RangeRow {
+            label: "Facet Count";
+            icon: @image-url("../icons/diamond.svg");
+            accent: Theme.accent-amber;
+            bound_min: root.facets_bounds_min;
+            bound_max: root.facets_bounds_max;
+            value_min <=> root.facets_filter_min;
+            value_max <=> root.facets_filter_max;
+            is_integer: true;
+            changed => { root.changed(); }
+        }
+
+        Button {
+            text: "Reset Filters";
+            icon: @image-url("../icons/reset.svg");
+            colorize-icon: true;
+            clicked => { root.reset(); }
+        }
+        }
+    }
+}

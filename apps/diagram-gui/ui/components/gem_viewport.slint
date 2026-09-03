@@ -1,0 +1,802 @@
+import { ComboBox, Button } from "std-widgets.slint";
+import { Theme } from "../theme.slint";
+import { LightingPresetItem } from "../types.slint";
+import { SettingsDialog } from "settings_dialog.slint";
+import { MaterialEditorDialog } from "material_editor_dialog.slint";
+import { PerformanceGraphDialog } from "performance_graph_dialog.slint";
+import { ExportDialog } from "export_dialog.slint";
+
+export component GemViewportView inherits Rectangle {
+    vertical-stretch: 1;
+    min-height: 380px;
+
+    in property <image> render_image;
+    in property <bool> has_render: false;
+    in property <[string]> material_options: ["Diamond", "Sapphire", "Ruby", "Emerald", "Zircon", "Tanzanite", "Moissanite", "Topaz", "Spinel", "Quartz"];
+    in-out property <int> selected_material_index: 0;
+    // Corrected label (was mislabelled "5500K"; D65 is 6500K) -- see
+    // `app.slint`'s `lighting_options` doc comment. This default is overridden in
+    // practice by `app.slint`'s own `lighting_options: root.lighting_options` binding,
+    // but kept in sync anyway.
+    in property <[string]> lighting_options: ["D65 Daylight (6500K)", "Incandescent (3200K)", "Gem Studio Ring Lights", "Dramatic Dark Spotlight"];
+    in-out property <int> selected_lighting_index: 2; // Ring Lights default
+
+    in property <float> brilliance_pct: 0.0;
+    in property <float> fire_index: 0.0;
+    in property <float> scintillation_pct: 0.0;
+    in property <float> windowing_pct: 0.0;
+    in property <float> extinction_pct: 0.0;
+    in property <[float]> graph_brilliance: [20.0, 25.0, 32.0, 42.0, 50.0, 58.0, 65.0, 72.0, 78.0, 82.0, 84.0, 85.0, 84.0, 82.0, 80.0, 76.0, 70.0, 62.0, 50.0];
+    in property <[float]> graph_extinction: [65.0, 58.0, 50.0, 40.0, 32.0, 25.0, 18.0, 14.0, 10.0, 8.0, 6.0, 5.0, 6.0, 7.0, 9.0, 12.0, 18.0, 26.0, 38.0];
+    in property <[float]> graph_windowing: [40.0, 35.0, 28.0, 20.0, 15.0, 10.0, 8.0, 6.0, 5.0, 4.0, 4.0, 5.0, 6.0, 8.0, 10.0, 14.0, 18.0, 24.0, 30.0];
+    // SVG path-data strings (0..100 x 0..100 viewbox) for the same three curves --
+    // see `performance_graph_dialog.slint`'s chart canvas section for how they're drawn.
+    in property <string> graph_brilliance_path: "";
+    in property <string> graph_extinction_path: "";
+    in property <string> graph_windowing_path: "";
+    // The Tilt Performance dialog's other three camera azimuths -- see
+    // `performance_graph_dialog.slint`'s matching properties for the full doc, and
+    // `gui::tilt_profile` for what computes these (off the UI thread, lazily, only
+    // while that dialog is open).
+    in property <[[float]]> graph_brilliance_extra_axes: [];
+    in property <[[float]]> graph_extinction_extra_axes: [];
+    in property <[[float]]> graph_windowing_extra_axes: [];
+    in property <[string]> graph_brilliance_extra_paths: [];
+    in property <[string]> graph_extinction_extra_paths: [];
+    in property <[string]> graph_windowing_extra_paths: [];
+    in property <bool> extra_axes_loading: false;
+    in property <float> cam_pitch_deg: 45.0;
+
+    in-out property <bool> settings_open: false;
+    in-out property <bool> material_editor_open: false;
+    in-out property <bool> performance_dialog_open: false;
+    // Fired whenever `performance_dialog_open` transitions to `true` -- see the
+    // `changed` handler near the end of this component. `gui::tilt_profile` uses this
+    // to (re)compute the three non-canonical azimuths the moment the dialog that
+    // actually shows them is opened, rather than on every render frame.
+    callback request_tilt_profile_axes();
+    in-out property <bool> render_paused: false;
+    // "Target Samples" slider exponent (3..=10 => 8..1024 samples), replacing
+    // the old four-tier quality preset -- see `app.slint`'s matching property doc
+    // comment.
+    in-out property <float> target_samples_exponent: 8.0; // 256 samples
+    in-out property <int> bounce_index: 2; // 12 Bounces -- see settings_dialog.slint's pill ladder (4/8/12/24/64/128)
+    in-out property <float> exposure_val: 1.0;
+    in-out property <float> light_yaw_deg: 48.0;
+    in-out property <float> light_pitch_deg: 54.0;
+    // Inclusion/subsurface scattering amount -- see `app.slint`'s matching
+    // property doc comment.
+    in-out property <float> inclusion_sigma_s: 0.0;
+    // Crystal-axis orientation override -- see `app.slint`'s matching property
+    // doc comment.
+    in-out property <bool> c_axis_override_enabled: false;
+    in-out property <float> c_axis_tilt_deg: 0.0;
+    in-out property <float> c_axis_azimuth_deg: 0.0;
+    in property <bool> c_axis_override_available: true;
+    // Bruted (frosted) girdle finish toggle -- see `app.slint`'s matching
+    // property doc comment.
+    in-out property <bool> girdle_frosted: false;
+    // Facet edge rounding radius -- see `app.slint`'s matching property doc
+    // comment.
+    in-out property <float> edge_rounding_radius: 0.0;
+    // Physical stone size (girdle width, mm) -- see `app.slint`'s matching
+    // property doc comment.
+    in-out property <float> stone_width_mm: 0.0;
+    // Live render resolution pill index (0: 640x480, 1: 800x600 default, 2: 1280x720,
+    // 3: 1920x1080) -- see `app.slint`'s matching property doc comment.
+    in-out property <int> resolution_index: 1;
+    // Local preview-then-settle rendering -- see `app.slint`'s matching property
+    // doc comment.
+    in-out property <int> local_preview_scale_index: 0;
+    // Live rendering's Local/Remote/Local+Remote choice -- see `app.slint`'s matching
+    // property doc comment.
+    in-out property <int> live_compute_target_index: 2;
+    in property <bool> live_remote_available: false;
+    // HDR environment map -- see `app.slint`'s matching property doc comment.
+    in-out property <string> env_map_path: "";
+    in property <string> env_map_status: "";
+    in property <bool> env_map_loaded: false;
+
+    // Named lighting presets -- passed straight through to SettingsDialog.
+    in property <[LightingPresetItem]> lighting_presets: [];
+
+    // High-resolution export. `is_exporting` also drives the Pause/Resume pill's
+    // displayed (amber/"Exporting") state below -- see that Rectangle's own doc comment
+    // -- since `RenderContext::export_active` suspends live tracing on the Rust side for
+    // the same duration.
+    in-out property <bool> export_open: false;
+    in property <bool> is_exporting: false;
+    in property <float> export_progress: 0.0;
+    in property <string> export_status_message: "";
+    in property <bool> export_has_error: false;
+    in property <image> export_preview_image;
+    in property <int> export_preview_samples_done: 0;
+    in property <int> export_preview_samples_total: 0;
+    // Remote compute availability for the export dialog's "Compute" pill -- see
+    // `export_dialog.slint`'s matching property doc comments.
+    in property <bool> export_remote_available: false;
+    in property <string> export_remote_unavailable_reason: "";
+
+    property <length> last_mouse_x;
+    property <length> last_mouse_y;
+    property <bool> is_right_drag: false;
+    // Tracked ourselves rather than reading `touch_area.pressed`: Slint's built-in
+    // `TouchArea.pressed` is only ever set to `true` for the *left* mouse button (see
+    // `i-slint-core`'s `TouchArea::input_event`, which gates `pressed.set(true)` on
+    // `PointerEventButton::Left` in its `Pressed` arm). Gating the `moved` handler
+    // below on `touch_area.pressed` -- as it used to -- meant a right-button drag never
+    // updated `pressed`, so the light-move branch below it was correctly selected via
+    // `is_right_drag` but never actually reached.
+    property <bool> is_dragging: false;
+
+    callback camera_orbit(float, float); // dx, dy
+    callback camera_zoom(float); // delta
+    callback light_move(float, float); // dx, dy
+    callback light_pos_changed(float, float); // yaw_deg, pitch_deg
+    callback reset_camera();
+    callback material_changed(string);
+    // Carries the selected preset's index, not its display string -- see
+    // `app.slint`'s matching callback doc comment.
+    callback lighting_changed(int);
+    callback target_samples_changed(int);
+    // Live render resolution -- carries the resolved (width, height) pair, see
+    // `app.slint`'s matching callback doc comment.
+    callback resolution_changed(int, int);
+    // Local preview-then-settle rendering -- see `app.slint`'s matching
+    // callback doc comment.
+    callback local_preview_scale_changed(int);
+    // Live rendering's Local/Remote/Local+Remote choice -- see `app.slint`'s matching
+    // callback doc comment.
+    callback live_compute_target_changed(int);
+    // HDR environment map -- see `app.slint`'s matching callback doc comment.
+    callback load_env_map(string);
+    // Native file-open picker for `env_map_path` -- see `app.slint`'s/`settings_dialog.slint`'s
+    // matching `pick_hdr_file` doc comments.
+    callback pick_hdr_file(string) -> string;
+    callback clear_env_map();
+    callback bounces_changed(int);
+    callback exposure_changed(float);
+    callback inclusion_changed(float);
+    callback c_axis_override_changed(bool);
+    callback c_axis_angles_changed(float, float);
+    callback girdle_frosted_changed(bool);
+    callback edge_rounding_changed(float);
+    // Physical stone size (girdle width, mm) -- see `app.slint`'s matching
+    // callback doc comment.
+    callback stone_width_changed(float);
+    callback copy_metrics();
+    callback copy_curve_data();
+    // name, ri, dispersion, birefringence, color_idx, crystal_system_idx,
+    // optical_character_idx, biaxial_delta_beta_alpha -- see
+    // `MaterialEditorDialog.save_material`'s own callback doc comment.
+    callback save_custom_material(string, float, float, float, int, int, int, float);
+    callback delete_custom_material(string);
+    callback pause_toggled(bool);
+    callback save_lighting_preset(string);
+    callback apply_lighting_preset(int);
+    callback rename_lighting_preset(int, string);
+    callback delete_lighting_preset(int);
+    // Adds a 4th argument (colour-space index) and a 5th (compute-target index) --
+    // see `app.slint`'s matching callback doc comment.
+    callback start_export(int, int, int, int, int);
+    callback cancel_export();
+    // Fired by `changed export_open` below, every time the export dialog opens -- see
+    // `app.slint`'s matching callback doc comment.
+    callback check_remote_availability();
+
+    // Fires `request_tilt_profile_axes` exactly when the Tilt Performance dialog
+    // opens -- covers every path that flips `performance_dialog_open` to `true`
+    // (the viewport toolbar button and the settings dialog's own shortcut into it)
+    // from one place, rather than duplicating the call at each `= true` site.
+    changed performance_dialog_open => {
+        if root.performance_dialog_open {
+            root.request_tilt_profile_axes();
+        }
+    }
+
+    // Re-checks remote worker availability every time the export dialog opens (not
+    // just once at startup) -- a worker that was down, or wasn't configured yet, the
+    // last time this ran may be reachable now, and the "Compute" pill's default/
+    // disabled state (`export_remote_available`/`export_remote_unavailable_reason`)
+    // should reflect the CURRENT state, not a stale one. Same one-place-covers-every-
+    // path idiom as `changed performance_dialog_open` just above.
+    changed export_open => {
+        if root.export_open {
+            root.check_remote_availability();
+        }
+    }
+
+    background: #080a0f;
+    border-radius: Theme.radius-md;
+    border-width: 1px;
+    border-color: Theme.border-subtle;
+    clip: true;
+
+    // Viewport TouchArea for Orbit, Pan, Zoom with True Incremental Deltas
+    touch_area := TouchArea {
+        enabled: !root.settings_open && !root.material_editor_open && !root.performance_dialog_open;
+
+        pointer-event(event) => {
+            if (event.kind == PointerEventKind.down) {
+                root.last_mouse_x = touch_area.mouse-x;
+                root.last_mouse_y = touch_area.mouse-y;
+                // Shift+drag is an ALTERNATIVE to the right button, not a convenience:
+                // on a Windows Precision Touchpad, holding the two-finger right-click
+                // gesture and moving is delivered by the driver as a held *left*
+                // button, so a laptop user physically cannot produce a right-drag no
+                // matter how this is wired. The light would silently orbit the camera
+                // instead. A modifier+left-drag is the standard answer (it is why 3D
+                // applications have one at all), and it costs mouse users nothing --
+                // the right button still works exactly as before.
+                //
+                // Captured once, at `down`, rather than read live during `moved`: the
+                // gesture's meaning is fixed when it starts, so pressing or releasing
+                // Shift mid-drag must not flip the camera into the light halfway
+                // through a movement.
+                root.is_right_drag = (event.button == PointerEventButton.right)
+                    || event.modifiers.shift;
+                root.is_dragging = true;
+            } else if (event.kind == PointerEventKind.up || event.kind == PointerEventKind.cancel) {
+                root.is_dragging = false;
+            }
+        }
+        moved => {
+            if (root.is_dragging) {
+                let dx = (touch_area.mouse-x - root.last_mouse_x) / 1px;
+                let dy = (touch_area.mouse-y - root.last_mouse_y) / 1px;
+                root.last_mouse_x = touch_area.mouse-x;
+                root.last_mouse_y = touch_area.mouse-y;
+                if (root.is_right_drag) {
+                    root.light_move(dx, dy);
+                } else {
+                    root.camera_orbit(dx, dy);
+                }
+            }
+        }
+        scroll-event(event) => {
+            root.camera_zoom(event.delta-y / 1px);
+            accept
+        }
+    }
+
+    // Live Rendered Image
+    if root.has_render: Image {
+        width: 100%;
+        height: 100%;
+        source: root.render_image;
+        image-fit: contain;
+    }
+
+    // Fallback when initial state
+    if !root.has_render: VerticalLayout {
+        alignment: center;
+        spacing: 12px;
+
+        Image {
+            source: @image-url("../icons/gem.svg");
+            colorize: Theme.text-muted;
+            width: 56px;
+            height: 56px;
+            horizontal-alignment: center;
+        }
+
+        Text {
+            text: "Physically Based Spectral Gem Viewport";
+            font-size: 16px;
+            font-weight: 700;
+            color: Theme.text-primary;
+            horizontal-alignment: center;
+        }
+
+        Text {
+            text: "Drag with left mouse button to rotate freely in 3D";
+            font-size: 12px;
+            color: Theme.text-muted;
+            horizontal-alignment: center;
+        }
+    }
+
+    // --- TOP CONTROLS OVERLAY (Material, Lighting, Settings & Metrics) ---
+    VerticalLayout {
+        padding: 12px;
+        alignment: space-between;
+
+        HorizontalLayout {
+            alignment: space-between;
+
+            // Material & Lighting Selectors & Action Buttons
+            HorizontalLayout {
+                spacing: 8px;
+
+                // Material Dropdown
+                Rectangle {
+                    width: 140px;
+                    height: 32px;
+                    background: #1e293bee;
+                    border-radius: Theme.radius-sm;
+                    border-width: 1px;
+                    border-color: Theme.border-medium;
+
+                    ComboBox {
+                        model: root.material_options;
+                        current-index <=> root.selected_material_index;
+                        selected(val) => { root.material_changed(val); }
+                    }
+                }
+
+                // Edit / Custom Material Button (✎)
+                Rectangle {
+                    width: 32px;
+                    height: 32px;
+                    background: root.material_editor_open ? Theme.accent-purple : (edit_mat_touch.has-hover ? Theme.bg-elevated : #1e293bee);
+                    border-radius: Theme.radius-sm;
+                    border-width: 1px;
+                    border-color: root.material_editor_open ? Theme.accent-purple : Theme.border-medium;
+
+                    edit_mat_touch := TouchArea {
+                        clicked => { root.material_editor_open = !root.material_editor_open; }
+                    }
+
+                    Image {
+                        source: @image-url("../icons/pencil.svg");
+                        colorize: root.material_editor_open ? #ffffff : Theme.accent-purple;
+                        width: 15px;
+                        height: 15px;
+                        horizontal-alignment: center;
+                        vertical-alignment: center;
+                    }
+                }
+
+                // Lighting Dropdown
+                Rectangle {
+                    width: 190px;
+                    height: 32px;
+                    background: #1e293bee;
+                    border-radius: Theme.radius-sm;
+                    border-width: 1px;
+                    border-color: Theme.border-medium;
+
+                    ComboBox {
+                        model: root.lighting_options;
+                        current-index <=> root.selected_lighting_index;
+                        // Emits the INDEX (already synced into
+                        // `selected_lighting_index` via the two-way binding above by
+                        // the time `selected` fires), not the display string `val`.
+                        selected(val) => { root.lighting_changed(root.selected_lighting_index); }
+                    }
+                }
+
+                // Performance Curve Graph Trigger Button (📊 Tilt Curve)
+                Rectangle {
+                    height: 32px;
+                    background: root.performance_dialog_open ? Theme.accent-cyan : (perf_touch.has-hover ? Theme.bg-elevated : #1e293bee);
+                    border-radius: Theme.radius-sm;
+                    border-width: 1px;
+                    border-color: root.performance_dialog_open ? Theme.accent-cyan : Theme.border-medium;
+
+                    perf_touch := TouchArea {
+                        clicked => { root.performance_dialog_open = !root.performance_dialog_open; }
+                    }
+
+                    HorizontalLayout {
+                        padding-left: 8px;
+                        padding-right: 8px;
+                        spacing: 5px;
+                        alignment: center;
+                        Image {
+                            source: @image-url("../icons/bar-chart.svg");
+                            colorize: root.performance_dialog_open ? #0f172a : Theme.text-primary;
+                            width: 13px;
+                            height: 13px;
+                            vertical-alignment: center;
+                        }
+                        Text {
+                            text: "Tilt Curve";
+                            font-size: 11px;
+                            font-weight: 600;
+                            color: root.performance_dialog_open ? #0f172a : Theme.text-primary;
+                            vertical-alignment: center;
+                        }
+                    }
+                }
+
+                // Reset Camera Button
+                Rectangle {
+                    width: 32px;
+                    height: 32px;
+                    background: reset_touch.has-hover ? Theme.bg-elevated : #1e293bee;
+                    border-radius: Theme.radius-sm;
+                    border-width: 1px;
+                    border-color: Theme.border-medium;
+
+                    reset_touch := TouchArea {
+                        clicked => { root.reset_camera(); }
+                    }
+
+                    Image {
+                        source: @image-url("../icons/reset.svg");
+                        colorize: Theme.text-secondary;
+                        width: 16px;
+                        height: 16px;
+                        horizontal-alignment: center;
+                        vertical-alignment: center;
+                    }
+                }
+
+                // Pause / Resume Render Button -- explicit user pause control (Task: render pause/stop).
+                // Also reflects `is_exporting` for DISPLAY purposes only, the same amber
+                // "suspended" treatment `render_paused` already gets -- see
+                // `RenderContext::export_active`'s own doc comment for why an export
+                // suspends local tracing without touching `render_paused` itself. The
+                // touch area is disabled while exporting so a click can't flip the
+                // user's real pause state out from under them while its displayed state
+                // is showing something else (it would otherwise toggle `render_paused`
+                // from whatever the user actually left it at, not from what's on screen).
+                Rectangle {
+                    height: 32px;
+                    background: (root.render_paused || root.is_exporting) ? Theme.accent-amber : (pause_touch.has-hover ? Theme.bg-elevated : #1e293bee);
+                    border-radius: Theme.radius-sm;
+                    border-width: 1px;
+                    border-color: (root.render_paused || root.is_exporting) ? Theme.accent-amber : Theme.border-medium;
+
+                    pause_touch := TouchArea {
+                        enabled: !root.is_exporting;
+                        clicked => {
+                            root.render_paused = !root.render_paused;
+                            root.pause_toggled(root.render_paused);
+                        }
+                    }
+
+                    HorizontalLayout {
+                        padding-left: 8px;
+                        padding-right: 8px;
+                        spacing: 5px;
+                        alignment: center;
+                        Image {
+                            source: root.render_paused ? @image-url("../icons/play.svg") : @image-url("../icons/pause.svg");
+                            colorize: (root.render_paused || root.is_exporting) ? #0f172a : Theme.text-primary;
+                            width: 13px;
+                            height: 13px;
+                            vertical-alignment: center;
+                        }
+                        Text {
+                            text: root.render_paused ? "Paused" : (root.is_exporting ? "Exporting" : "Live");
+                            font-size: 11px;
+                            font-weight: 600;
+                            color: (root.render_paused || root.is_exporting) ? #0f172a : Theme.text-primary;
+                            vertical-alignment: center;
+                        }
+                    }
+                }
+
+                // Settings Dialog Trigger Button (⚙)
+                Rectangle {
+                    width: 32px;
+                    height: 32px;
+                    background: root.settings_open ? Theme.accent-cyan : (settings_touch.has-hover ? Theme.bg-elevated : #1e293bee);
+                    border-radius: Theme.radius-sm;
+                    border-width: 1px;
+                    border-color: root.settings_open ? Theme.accent-cyan : Theme.border-medium;
+
+                    settings_touch := TouchArea {
+                        clicked => { root.settings_open = !root.settings_open; }
+                    }
+
+                    Image {
+                        source: @image-url("../icons/gear.svg");
+                        colorize: root.settings_open ? #0f172a : Theme.text-secondary;
+                        width: 15px;
+                        height: 15px;
+                        horizontal-alignment: center;
+                        vertical-alignment: center;
+                    }
+                }
+
+                // High-Resolution Export Trigger Button
+                Rectangle {
+                    height: 32px;
+                    background: (root.export_open || root.is_exporting) ? Theme.accent-emerald : (export_touch.has-hover ? Theme.bg-elevated : #1e293bee);
+                    border-radius: Theme.radius-sm;
+                    border-width: 1px;
+                    border-color: (root.export_open || root.is_exporting) ? Theme.accent-emerald : Theme.border-medium;
+
+                    export_touch := TouchArea {
+                        clicked => { root.export_open = !root.export_open; }
+                    }
+
+                    HorizontalLayout {
+                        padding-left: 8px;
+                        padding-right: 8px;
+                        spacing: 5px;
+                        alignment: center;
+                        Image {
+                            source: @image-url("../icons/save.svg");
+                            colorize: (root.export_open || root.is_exporting) ? #0f172a : Theme.text-primary;
+                            width: 13px;
+                            height: 13px;
+                            vertical-alignment: center;
+                        }
+                        Text {
+                            text: root.is_exporting ? "Exporting..." : "Export";
+                            font-size: 11px;
+                            font-weight: 600;
+                            color: (root.export_open || root.is_exporting) ? #0f172a : Theme.text-primary;
+                            vertical-alignment: center;
+                        }
+                    }
+                }
+            }
+
+            // Real-Time 5-Point Gemological Metrics HUD
+            Rectangle {
+                background: #0f172aee;
+                border-radius: Theme.radius-sm;
+                border-width: 1px;
+                border-color: Theme.border-medium;
+
+                TouchArea {
+                    clicked => { root.copy_metrics(); }
+                }
+
+                HorizontalLayout {
+                    padding-left: 10px;
+                    padding-right: 10px;
+                    padding-top: 6px;
+                    padding-bottom: 6px;
+                    spacing: 12px;
+
+                    HorizontalLayout {
+                        spacing: 4px;
+                        Text { text: "Brilliance:"; font-size: 11px; font-weight: 600; color: Theme.text-muted; }
+                        Text { text: Math.round(root.brilliance_pct) + "%"; font-size: 11px; font-weight: 700; color: Theme.accent-emerald; }
+                    }
+
+                    HorizontalLayout {
+                        spacing: 4px;
+                        Text { text: "Fire:"; font-size: 11px; font-weight: 600; color: Theme.text-muted; }
+                        Text { text: Math.round(root.fire_index * 100.0) / 100.0; font-size: 11px; font-weight: 700; color: Theme.accent-cyan; }
+                    }
+
+                    HorizontalLayout {
+                        spacing: 4px;
+                        Text { text: "Scintillation:"; font-size: 11px; font-weight: 600; color: Theme.text-muted; }
+                        Text { text: Math.round(root.scintillation_pct) + "%"; font-size: 11px; font-weight: 700; color: Theme.accent-purple; }
+                    }
+
+                    HorizontalLayout {
+                        spacing: 4px;
+                        Text { text: "Windowing:"; font-size: 11px; font-weight: 600; color: Theme.text-muted; }
+                        Text { text: Math.round(root.windowing_pct) + "%"; font-size: 11px; font-weight: 700; color: root.windowing_pct > 10.0 ? Theme.accent-ruby : Theme.text-secondary; }
+                    }
+
+                    HorizontalLayout {
+                        spacing: 4px;
+                        Text { text: "Extinction:"; font-size: 11px; font-weight: 600; color: Theme.text-muted; }
+                        Text { text: Math.round(root.extinction_pct) + "%"; font-size: 11px; font-weight: 700; color: root.extinction_pct > 12.0 ? Theme.accent-amber : Theme.text-secondary; }
+                    }
+                }
+            }
+        }
+
+        // --- BOTTOM INTERACTION HINT BADGES ---
+        HorizontalLayout {
+            spacing: 8px;
+            alignment: center;
+
+            Rectangle {
+                background: #1e293bdd;
+                border-radius: Theme.radius-sm;
+                border-width: 1px;
+                border-color: Theme.border-subtle;
+                HorizontalLayout {
+                    padding-left: 8px; padding-right: 8px; padding-top: 4px; padding-bottom: 4px; spacing: 5px;
+                    Image { source: @image-url("../icons/mouse.svg"); colorize: #cbd5e1; width: 10px; height: 10px; vertical-alignment: center; }
+                    Text { text: "Left Drag: 360° Gem Orbit"; font-size: 10px; font-weight: 600; color: #cbd5e1; vertical-alignment: center; }
+                }
+            }
+
+            Rectangle {
+                background: #1e293bdd;
+                border-radius: Theme.radius-sm;
+                border-width: 1px;
+                border-color: Theme.border-subtle;
+                HorizontalLayout {
+                    padding-left: 8px; padding-right: 8px; padding-top: 4px; padding-bottom: 4px; spacing: 5px;
+                    Image { source: @image-url("../icons/lightbulb.svg"); colorize: #cbd5e1; width: 10px; height: 10px; vertical-alignment: center; }
+                    Text { text: "Right / Shift+Drag: Move Light"; font-size: 10px; font-weight: 600; color: #cbd5e1; vertical-alignment: center; }
+                }
+            }
+
+            Rectangle {
+                background: #1e293bdd;
+                border-radius: Theme.radius-sm;
+                border-width: 1px;
+                border-color: Theme.border-subtle;
+                HorizontalLayout {
+                    padding-left: 8px; padding-right: 8px; padding-top: 4px; padding-bottom: 4px; spacing: 5px;
+                    Image { source: @image-url("../icons/search.svg"); colorize: #cbd5e1; width: 10px; height: 10px; vertical-alignment: center; }
+                    Text { text: "Scroll: Zoom"; font-size: 10px; font-weight: 600; color: #cbd5e1; vertical-alignment: center; }
+                }
+            }
+
+            Rectangle {
+                background: #1e293bdd;
+                border-radius: Theme.radius-sm;
+                border-width: 1px;
+                border-color: Theme.border-subtle;
+                HorizontalLayout {
+                    padding-left: 8px; padding-right: 8px; padding-top: 4px; padding-bottom: 4px; spacing: 5px;
+                    Image { source: @image-url("../icons/clipboard.svg"); colorize: #cbd5e1; width: 10px; height: 10px; vertical-alignment: center; }
+                    Text { text: "Click HUD: Copy Metrics"; font-size: 10px; font-weight: 600; color: #cbd5e1; vertical-alignment: center; }
+                }
+            }
+        }
+    }
+
+    // --- MODAL BACKDROP FOR SETTINGS DIALOG ---
+    if root.settings_open: Rectangle {
+        width: 100%;
+        height: 100%;
+        background: #00000055;
+        z: 150;
+
+        TouchArea {
+            clicked => { root.settings_open = false; }
+        }
+    }
+
+    // --- FLOATING SETTINGS DIALOG CARD ---
+    if root.settings_open: SettingsDialog {
+        x: 12px;
+        y: 48px;
+        z: 200;
+        is_open <=> root.settings_open;
+        // Same value the modal backdrop above resolves `height: 100%` to (both are
+        // sized off `root`, `GemViewportView`'s own height) -- see
+        // `SettingsDialog.available_height`'s doc comment for why it needs this passed
+        // in explicitly rather than reading its own parent's size.
+        available_height: root.height;
+        target_samples_exponent <=> root.target_samples_exponent;
+        resolution_index <=> root.resolution_index;
+        local_preview_scale_index <=> root.local_preview_scale_index;
+        live_compute_target_index <=> root.live_compute_target_index;
+        live_remote_available: root.live_remote_available;
+        selected_bounce_index <=> root.bounce_index;
+        exposure_val <=> root.exposure_val;
+        light_yaw_deg <=> root.light_yaw_deg;
+        light_pitch_deg <=> root.light_pitch_deg;
+        inclusion_sigma_s <=> root.inclusion_sigma_s;
+        c_axis_override_enabled <=> root.c_axis_override_enabled;
+        c_axis_tilt_deg <=> root.c_axis_tilt_deg;
+        c_axis_azimuth_deg <=> root.c_axis_azimuth_deg;
+        c_axis_override_available: root.c_axis_override_available;
+        girdle_frosted <=> root.girdle_frosted;
+        edge_rounding_radius <=> root.edge_rounding_radius;
+        stone_width_mm <=> root.stone_width_mm;
+        env_map_path <=> root.env_map_path;
+        env_map_status: root.env_map_status;
+        env_map_loaded: root.env_map_loaded;
+        graph_brilliance: root.graph_brilliance;
+        graph_extinction: root.graph_extinction;
+        graph_windowing: root.graph_windowing;
+        lighting_presets: root.lighting_presets;
+
+        close => { root.settings_open = false; }
+        open_performance_graph => {
+            root.settings_open = false;
+            root.performance_dialog_open = true;
+        }
+        target_samples_changed(exp) => { root.target_samples_changed(exp); }
+        resolution_changed(w, h) => { root.resolution_changed(w, h); }
+        local_preview_scale_changed(idx) => { root.local_preview_scale_changed(idx); }
+        live_compute_target_changed(idx) => { root.live_compute_target_changed(idx); }
+        bounces_changed(b) => { root.bounces_changed(b); }
+        exposure_changed(e) => { root.exposure_changed(e); }
+        inclusion_changed(s) => { root.inclusion_changed(s); }
+        c_axis_override_changed(enabled) => { root.c_axis_override_changed(enabled); }
+        c_axis_angles_changed(tilt, azimuth) => { root.c_axis_angles_changed(tilt, azimuth); }
+        girdle_frosted_changed(frosted) => { root.girdle_frosted_changed(frosted); }
+        edge_rounding_changed(r) => { root.edge_rounding_changed(r); }
+        stone_width_changed(w) => { root.stone_width_changed(w); }
+        load_env_map(path) => { root.load_env_map(path); }
+        pick_hdr_file(cur) => { root.pick_hdr_file(cur) }
+        clear_env_map => { root.clear_env_map(); }
+        light_pos_changed(y, p) => { root.light_pos_changed(y, p); }
+        save_lighting_preset(name) => { root.save_lighting_preset(name); }
+        apply_lighting_preset(idx) => { root.apply_lighting_preset(idx); }
+        rename_lighting_preset(idx, name) => { root.rename_lighting_preset(idx, name); }
+        delete_lighting_preset(idx) => { root.delete_lighting_preset(idx); }
+        reset_defaults => {
+            root.target_samples_exponent = 8.0;
+            root.resolution_index = 1;
+            root.local_preview_scale_index = 0;
+            root.live_compute_target_index = 2;
+            root.bounce_index = 2;
+            root.exposure_val = 1.0;
+            root.light_yaw_deg = 48.0;
+            root.light_pitch_deg = 54.0;
+            root.inclusion_sigma_s = 0.0;
+            root.c_axis_override_enabled = false;
+            root.c_axis_tilt_deg = 0.0;
+            root.c_axis_azimuth_deg = 0.0;
+            root.girdle_frosted = false;
+            root.edge_rounding_radius = 0.0;
+            root.stone_width_mm = 0.0;
+            root.target_samples_changed(8);
+            root.resolution_changed(800, 600);
+            root.local_preview_scale_changed(0);
+            root.live_compute_target_changed(2);
+            root.bounces_changed(12);
+            root.exposure_changed(1.0);
+            root.light_pos_changed(48.0, 54.0);
+            root.inclusion_changed(0.0);
+            root.c_axis_override_changed(false);
+            root.c_axis_angles_changed(0.0, 0.0);
+            root.girdle_frosted_changed(false);
+            root.edge_rounding_changed(0.0);
+            root.stone_width_changed(0.0);
+        }
+    }
+
+    // --- MODAL GEM MATERIAL EDITOR DIALOG ---
+    if root.material_editor_open: MaterialEditorDialog {
+        width: 100%;
+        height: 100%;
+        z: 300;
+
+        close => { root.material_editor_open = false; }
+        save_material(name, ri, disp, biref, color_idx, crystal_system_idx, optical_character_idx, biaxial_delta_beta_alpha) => {
+            root.save_custom_material(name, ri, disp, biref, color_idx, crystal_system_idx, optical_character_idx, biaxial_delta_beta_alpha);
+            root.material_editor_open = false;
+        }
+        delete_material(name) => {
+            root.delete_custom_material(name);
+            root.material_editor_open = false;
+        }
+    }
+
+    // --- MODAL PERFORMANCE GRAPH DIALOG ---
+    if root.performance_dialog_open: PerformanceGraphDialog {
+        width: 100%;
+        height: 100%;
+        z: 350;
+        graph_brilliance: root.graph_brilliance;
+        graph_extinction: root.graph_extinction;
+        graph_windowing: root.graph_windowing;
+        graph_brilliance_path: root.graph_brilliance_path;
+        graph_extinction_path: root.graph_extinction_path;
+        graph_windowing_path: root.graph_windowing_path;
+        graph_brilliance_extra_axes: root.graph_brilliance_extra_axes;
+        graph_extinction_extra_axes: root.graph_extinction_extra_axes;
+        graph_windowing_extra_axes: root.graph_windowing_extra_axes;
+        graph_brilliance_extra_paths: root.graph_brilliance_extra_paths;
+        graph_extinction_extra_paths: root.graph_extinction_extra_paths;
+        graph_windowing_extra_paths: root.graph_windowing_extra_paths;
+        extra_axes_loading: root.extra_axes_loading;
+        cam_pitch_deg: root.cam_pitch_deg;
+        material_name: root.material_options[root.selected_material_index];
+
+        close => { root.performance_dialog_open = false; }
+        copy_curve_data => { root.copy_curve_data(); }
+    }
+
+    // --- MODAL HIGH-RESOLUTION EXPORT DIALOG ---
+    if root.export_open: ExportDialog {
+        width: 100%;
+        height: 100%;
+        z: 400;
+        is_exporting: root.is_exporting;
+        export_progress: root.export_progress;
+        export_status_message: root.export_status_message;
+        export_has_error: root.export_has_error;
+        export_preview_image: root.export_preview_image;
+        export_preview_samples_done: root.export_preview_samples_done;
+        export_preview_samples_total: root.export_preview_samples_total;
+        remote_available: root.export_remote_available;
+        remote_unavailable_reason: root.export_remote_unavailable_reason;
+
+        close => { root.export_open = false; }
+        start_export(w, h, spp, cs, ct) => { root.start_export(w, h, spp, cs, ct); }
+        cancel_export => { root.cancel_export(); }
+    }
+}

@@ -1,0 +1,566 @@
+import { Button, LineEdit, ComboBox, SpinBox, Slider } from "std-widgets.slint";
+import { Theme } from "../theme.slint";
+import { WorkerItem } from "../types.slint";
+
+// Remote rendering: the worker-list panel -- add/edit/remove configured remote
+// render workers, per-worker transfer mode / cadence / preview scale, a "Test
+// connection" button, and token-based enrollment ("Redeem" -- claims a
+// `gemray-worker cert issue-token` token directly, so installing the worker binary and
+// running `cert claim` in a terminal is no longer required). Kept thin per the task's
+// own instruction: every field here is plain data round-tripped to Rust by list index
+// (same convention as `SettingsDialog`'s lighting-preset list); all the actual
+// protocol/connection logic lives in `gemray_net::client`/`gemray_net::enroll` and
+// `apps/diagram-gui/src/bridge/remote_render.rs`/`bridge::enroll`, already unit-tested
+// there without any GUI involved.
+//
+// Inherits `PopupWindow`, not `Rectangle`: this used to be a plain `Rectangle`-based
+// conditional child of `HeaderToolbar`, which paints as part of `HeaderToolbar`'s
+// subtree -- and `HeaderToolbar` is declared before the main workspace layout in
+// `app.slint`, so it always painted underneath the detail panel with no `z` value able
+// to fix it (`z` only reorders siblings, it can't reach across subtrees). A
+// `PopupWindow` renders in Slint's dedicated popup layer, always on top of the rest of
+// the window regardless of declaration order. See `filter_panel.slint`'s doc comment
+// for the full mechanism, including why an explicit content-driven `height` is needed
+// (`Rectangle`'s default sizing fills whatever it's anchored to). See `header.slint`'s
+// `remote_popup` instantiation for the show()/close() wiring this requires -- a
+// `PopupWindow` can't be used with the `if condition: RemoteWorkerDialog { ... }`
+// pattern that used to sit there (that's a compile error).
+export component RemoteWorkerDialog inherits PopupWindow {
+    in property <[WorkerItem]> workers: [];
+    in property <bool> denoise_enabled: true;
+    // The one-shot remote render's total sample budget -- carries the
+    // slider's EXPONENT (`gui::remote::REMOTE_SAMPLES_MIN_EXPONENT..=MAX_EXPONENT`,
+    // 128..=8192 samples), same treatment `settings_dialog.slint`'s own "Target
+    // Samples" slider gives the local interactive target. Global, not per-worker --
+    // same reasoning as `denoise_enabled` above (every worker in a session renders
+    // the identical request).
+    in-out property <float> remote_render_samples_exponent: 9.0; // 512 samples
+    // Rounded exponent driving the displayed sample count -- same continuous-drag-
+    // then-round idiom `settings_dialog.slint`'s own "Target Samples" slider uses
+    // (`sample_exponent`/`target_samples_count`): `SliderBase` only snaps to `step` on
+    // arrow-key nudges, not on pointer drag, so the rounding has to happen here.
+    property <int> remote_samples_rounded_exponent: Math.round(root.remote_render_samples_exponent);
+    // Shown while a worker (by list index) is being connect-tested.
+    in property <int> testing_index: -1;
+    // The most recent "Test connection" result text, and which row it belongs to.
+    in property <string> test_result_text: "";
+    in property <int> test_result_index: -1;
+    in property <bool> test_result_is_error: false;
+    // Which backend served the image currently on screen.
+    in property <bool> served_by_remote: false;
+    in property <string> served_by_worker_name: "";
+
+    // Token-based worker enrollment (redeem a `gemray-worker cert issue-token` token
+    // directly -- see `bridge::enroll`'s module doc comment). Rust owns the actual
+    // claim; these report its progress/result back to whichever row's form is open,
+    // matched by `claim_result_index` against `editing_index` below -- same convention
+    // `test_result_index`/`editing_index` already use together.
+    in property <bool> claiming_token: false;
+    in property <string> claim_result_text: "";
+    in property <int> claim_result_index: -1;
+    in property <bool> claim_result_is_error: false;
+    // Non-empty exactly when a claim just succeeded: the bundle directory Rust wrote
+    // it to. `changed claimed_cert_dir` below auto-fills `form_cert_dir` from it so the
+    // user never has to type or choose a path.
+    in property <string> claimed_cert_dir: "";
+
+    // Which library is currently being browsed (-1 = local, else an index
+    // into `workers` -- see `bridge::library_source::LibrarySource`) and pull-mirror
+    // sync progress for whichever row (if any) is currently mirroring (see
+    // `bridge::library_mirror`).
+    in property <int> library_source_worker_index: -1;
+    in property <int> mirror_worker_index: -1;
+    in property <bool> mirror_in_progress: false;
+    in property <float> mirror_progress_fraction: 0.0;
+    in property <string> mirror_status_text: "";
+    in property <bool> mirror_has_error: false;
+
+    // -1 while the add/edit form is closed; otherwise the index into `workers` being
+    // edited, or `workers.length` to mean "adding a new one".
+    property <int> editing_index: -1;
+    property <string> form_name: "";
+    property <string> form_address: "";
+    property <string> form_cert_dir: "";
+    property <int> form_transfer_mode_index: 0;
+    property <int> form_cadence_ms: 500;
+    property <int> form_preview_scale_index: 0;
+    property <int> form_preview_scale_percent: 50;
+    // Token-enrollment form fields. Deliberately never round-tripped into `WorkerItem`/
+    // `save_worker` (unlike every `form_*` field above) -- the enrollment address is
+    // meaningless once a worker is enrolled, and the token is a single-use secret that
+    // must not be persisted at all; see `bridge::enroll`'s module doc comment and this
+    // form's own "Redeem" handler below, which clears `form_token` on success.
+    property <string> form_enroll_addr: "";
+    property <string> form_token: "";
+
+    callback denoise_toggled(bool);
+    // Carries the slider's EXPONENT, not the resolved sample count -- see
+    // `remote_render_samples_exponent`'s own doc comment.
+    callback remote_render_samples_changed(int);
+    // (index into `workers`, or `workers.length` for a new one)
+    callback test_connection(int, string, string);
+    // (index to overwrite, or `workers.length` to append, WorkerItem)
+    callback save_worker(int, WorkerItem);
+    callback remove_worker(int);
+    // (index into `workers` or `workers.length` -- see `claim_result_index`'s own doc
+    // comment -- worker name, enrollment address, token)
+    callback claim_token(int, string, string, string);
+    // -1 for local, or an index into `workers`.
+    callback switch_library_source(int);
+    // Index into `workers` -- "Mirror to local" for that row.
+    callback start_mirror_sync(int);
+    callback cancel_mirror_sync();
+    // Native folder picker for `form_cert_dir` below. Takes the field's current text
+    // (so Rust can seed the dialog's starting directory from it) and returns the
+    // chosen folder, or the SAME text back unchanged if the user cancelled -- so the
+    // assignment at the call site is a safe no-op on cancel.
+    callback pick_cert_dir(string) -> string;
+
+    // Auto-fills the freshly claimed bundle directory into the open form's `cert_dir`
+    // field and clears the (single-use, never-persisted) token field -- fires whenever
+    // Rust sets `claimed_cert_dir` after a successful claim. Guarded by
+    // `claim_result_index == editing_index` so a claim that finishes after the user
+    // switched to editing a DIFFERENT row (or closed the form) never overwrites the
+    // wrong entry's in-progress edits.
+    changed claimed_cert_dir => {
+        if (root.claim_result_index == root.editing_index && root.claimed_cert_dir != "") {
+            root.form_cert_dir = root.claimed_cert_dir;
+            root.form_token = "";
+        }
+    }
+
+    function open_add_form() {
+        root.editing_index = root.workers.length;
+        root.form_name = "";
+        root.form_address = "";
+        root.form_cert_dir = "";
+        root.form_transfer_mode_index = 0;
+        root.form_cadence_ms = 500;
+        root.form_preview_scale_index = 0;
+        root.form_preview_scale_percent = 50;
+        root.form_enroll_addr = "";
+        root.form_token = "";
+    }
+
+    function open_edit_form(idx: int) {
+        root.editing_index = idx;
+        root.form_name = root.workers[idx].name;
+        root.form_address = root.workers[idx].address;
+        root.form_cert_dir = root.workers[idx].cert_dir;
+        root.form_transfer_mode_index = root.workers[idx].transfer_mode_index;
+        root.form_cadence_ms = root.workers[idx].cadence_ms;
+        root.form_preview_scale_index = root.workers[idx].preview_scale_index;
+        root.form_preview_scale_percent = root.workers[idx].preview_scale_percent;
+        root.form_enroll_addr = "";
+        root.form_token = "";
+    }
+
+    // The default `close-policy` (`close-on-click`) would close the popup on the very
+    // first click anywhere inside it -- including a keystroke-adjacent click on one of
+    // the LineEdits/SpinBox above or a press on Save/Cancel -- before that click could
+    // reach the control itself. `filter_panel.slint` (full of slider drags) makes the
+    // same choice for the same reason. Closing is handled explicitly instead: the '×'
+    // button below calls the inherited `close()`, and `header.slint`'s backdrop click
+    // handler calls it too.
+    close-policy: PopupClosePolicy.no-auto-close;
+
+    width: 420px;
+    // Content-driven height: matches whatever `content` (the padded VerticalLayout
+    // below) actually needs, instead of defaulting to the height of whatever this
+    // popup happens to be anchored to.
+    height: content.preferred-height;
+
+    Rectangle {
+        background: #111827ee;
+        border-radius: Theme.radius-md;
+        border-width: 1px;
+        border-color: #334155;
+        drop-shadow-blur: 24px;
+        drop-shadow-color: #000000ee;
+        drop-shadow-offset-y: 6px;
+        clip: true;
+
+    content := VerticalLayout {
+        padding: 16px;
+        spacing: 12px;
+
+        HorizontalLayout {
+            alignment: space-between;
+
+            HorizontalLayout {
+                spacing: 8px;
+                Image { source: @image-url("../icons/gem.svg"); colorize: Theme.accent-cyan; width: 15px; height: 15px; vertical-alignment: center; }
+                Text { text: "Remote Render Workers"; font-size: 13px; font-weight: 700; color: Theme.text-primary; vertical-alignment: center; }
+            }
+
+            Rectangle {
+                width: 24px;
+                height: 24px;
+                border-radius: 12px;
+                background: close_btn.has-hover ? #1e293b : transparent;
+                close_btn := TouchArea { clicked => { root.close(); } }
+                Text { text: "×"; font-size: 16px; color: Theme.text-secondary; horizontal-alignment: center; vertical-alignment: center; }
+            }
+        }
+
+        // Which backend produced what's currently on screen.
+        HorizontalLayout {
+            spacing: 6px;
+            Rectangle {
+                width: 7px;
+                height: 7px;
+                border-radius: 3.5px;
+                background: root.served_by_remote ? Theme.accent-emerald : Theme.text-muted;
+                y: 4px;
+            }
+            Text {
+                text: root.served_by_remote
+                    ? "Last frame rendered by: " + root.served_by_worker_name
+                    : "Last frame rendered locally.";
+                font-size: 10px;
+                color: Theme.text-muted;
+                wrap: word-wrap;
+            }
+        }
+
+        Rectangle { height: 1px; background: #1e293b; }
+
+        // Which library is currently being browsed. "Local library" is
+        // always available; clicking it while already local is a no-op switch back
+        // (harmless). Each worker row below carries its own "Browse library" toggle --
+        // see the worker-list section further down.
+        HorizontalLayout {
+            alignment: space-between;
+            Text { text: "Library"; font-size: 11px; color: Theme.text-secondary; vertical-alignment: center; }
+            Rectangle {
+                width: 90px;
+                height: 24px;
+                border-radius: Theme.radius-sm;
+                background: root.library_source_worker_index == -1 ? Theme.accent-cyan : Theme.bg-input;
+                border-width: 1px;
+                border-color: root.library_source_worker_index == -1 ? Theme.accent-cyan : Theme.border-subtle;
+                TouchArea { clicked => { root.switch_library_source(-1); } }
+                Text {
+                    text: "Local";
+                    font-size: 11px;
+                    font-weight: 600;
+                    color: root.library_source_worker_index == -1 ? #0f172a : Theme.text-secondary;
+                    horizontal-alignment: center;
+                    vertical-alignment: center;
+                }
+            }
+        }
+
+        Rectangle { height: 1px; background: #1e293b; }
+
+        // Denoise toggle -- applies to the merged image regardless of source (Task:
+        // remote rendering). See `settings::model::AppSettings::denoise_enabled`'s doc
+        // comment on why this is one global switch, not per-worker.
+        HorizontalLayout {
+            alignment: space-between;
+            Text { text: "Denoise merged image"; font-size: 11px; color: Theme.text-secondary; vertical-alignment: center; }
+            Rectangle {
+                width: 36px;
+                height: 20px;
+                border-radius: 10px;
+                background: root.denoise_enabled ? Theme.accent-cyan : #334155;
+                TouchArea { clicked => { root.denoise_toggled(!root.denoise_enabled); } }
+                Rectangle {
+                    width: 16px;
+                    height: 16px;
+                    border-radius: 8px;
+                    background: white;
+                    x: root.denoise_enabled ? parent.width - self.width - 2px : 2px;
+                    y: 2px;
+                    animate x { duration: 120ms; }
+                }
+            }
+        }
+
+        // Remote render sample budget: the one-shot full-quality request's
+        // total sample count -- global, not per-worker, same reasoning as "Denoise
+        // merged image" above. Moves in powers of two, same continuous-drag-then-round
+        // idiom `settings_dialog.slint`'s own "Target Samples" slider uses (image noise
+        // falls as 1/sqrt(N)), but over a WIDER range: see
+        // `gui::remote::REMOTE_SAMPLES_MIN_EXPONENT`/`MAX_EXPONENT`'s own doc comment
+        // for why a one-shot remote render affords a higher ceiling than the local
+        // interactive target's slider.
+        VerticalLayout {
+            spacing: 4px;
+            HorizontalLayout {
+                alignment: space-between;
+                Text { text: "Remote Render Samples"; font-size: 11px; color: Theme.text-secondary; vertical-alignment: center; }
+                Text {
+                    text: Math.round(Math.pow(2.0, root.remote_samples_rounded_exponent));
+                    font-size: 11px;
+                    font-weight: 700;
+                    color: Theme.accent-cyan;
+                }
+            }
+            Slider {
+                minimum: 7;
+                maximum: 13;
+                step: 1;
+                value <=> root.remote_render_samples_exponent;
+                changed(val) => { root.remote_render_samples_changed(root.remote_samples_rounded_exponent); }
+            }
+        }
+
+        Rectangle { height: 1px; background: #1e293b; }
+
+        // Worker list.
+        VerticalLayout {
+            spacing: 8px;
+            for worker[idx] in root.workers: Rectangle {
+                background: #0f172a;
+                border-radius: Theme.radius-sm;
+                border-width: 1px;
+                border-color: #334155;
+
+                VerticalLayout {
+                    padding: 8px;
+                    spacing: 4px;
+
+                    HorizontalLayout {
+                        alignment: space-between;
+                        Text { text: worker.name == "" ? worker.address : worker.name; font-size: 11px; font-weight: 700; color: Theme.text-primary; }
+                        HorizontalLayout {
+                            spacing: 4px;
+                            Rectangle {
+                                width: 20px; height: 20px; border-radius: 4px;
+                                background: edit_touch.has-hover ? #1e293b : transparent;
+                                edit_touch := TouchArea { clicked => { root.open_edit_form(idx); } }
+                                Image { source: @image-url("../icons/save.svg"); colorize: Theme.text-muted; width: 11px; height: 11px; horizontal-alignment: center; vertical-alignment: center; }
+                            }
+                            Rectangle {
+                                width: 20px; height: 20px; border-radius: 4px;
+                                background: remove_touch.has-hover ? #450a0a : transparent;
+                                remove_touch := TouchArea { clicked => { root.remove_worker(idx); } }
+                                Text { text: "×"; font-size: 13px; color: #f87171; horizontal-alignment: center; vertical-alignment: center; }
+                            }
+                        }
+                    }
+                    Text { text: worker.address; font-size: 10px; color: Theme.text-muted; }
+                    Text {
+                        text: (worker.transfer_mode_index == 0 ? "Live progressive" : "Final only")
+                            + " · " + worker.cadence_ms + "ms cadence · "
+                            + (worker.preview_scale_index == 0 ? "full" : worker.preview_scale_index == 1 ? "half" : worker.preview_scale_index == 2 ? "quarter" : worker.preview_scale_percent + "%")
+                            + " preview";
+                        font-size: 9px;
+                        color: Theme.text-muted;
+                    }
+
+                    HorizontalLayout {
+                        spacing: 6px;
+                        Button {
+                            text: root.testing_index == idx ? "Testing..." : "Test connection";
+                            enabled: root.testing_index != idx;
+                            height: 24px;
+                            clicked => { root.test_connection(idx, worker.address, worker.cert_dir); }
+                        }
+                    }
+                    if root.test_result_index == idx && root.test_result_text != "": Text {
+                        text: root.test_result_text;
+                        font-size: 9px;
+                        color: root.test_result_is_error ? #f87171 : Theme.accent-emerald;
+                        wrap: word-wrap;
+                    }
+
+                    // Browse this worker's design library, and/or pull-mirror
+                    // it into the local database -- see `bridge::library_source`/
+                    // `bridge::library_mirror`. Kept on every row (not gated on a
+                    // successful "Test connection" first) since either action reports
+                    // its own clear failure if the worker is unreachable or has no
+                    // library capacity, matching this dialog's existing "Test
+                    // connection" affordance's own always-available treatment.
+                    HorizontalLayout {
+                        spacing: 6px;
+                        Rectangle {
+                            height: 24px;
+                            horizontal-stretch: 1;
+                            border-radius: Theme.radius-sm;
+                            background: root.library_source_worker_index == idx ? Theme.accent-cyan : Theme.bg-input;
+                            border-width: 1px;
+                            border-color: root.library_source_worker_index == idx ? Theme.accent-cyan : Theme.border-subtle;
+                            TouchArea { clicked => { root.switch_library_source(idx); } }
+                            Text {
+                                text: root.library_source_worker_index == idx ? "Browsing this library" : "Browse library";
+                                font-size: 10px;
+                                font-weight: 600;
+                                color: root.library_source_worker_index == idx ? #0f172a : Theme.text-secondary;
+                                horizontal-alignment: center;
+                                vertical-alignment: center;
+                            }
+                        }
+                        Button {
+                            text: root.mirror_in_progress && root.mirror_worker_index == idx ? "Cancel" : "Mirror to local";
+                            height: 24px;
+                            enabled: !root.mirror_in_progress || root.mirror_worker_index == idx;
+                            clicked => {
+                                if (root.mirror_in_progress && root.mirror_worker_index == idx) {
+                                    root.cancel_mirror_sync();
+                                } else {
+                                    root.start_mirror_sync(idx);
+                                }
+                            }
+                        }
+                    }
+                    if root.mirror_worker_index == idx && root.mirror_in_progress: VerticalLayout {
+                        spacing: 3px;
+                        Rectangle {
+                            height: 4px;
+                            border-radius: 2px;
+                            background: #1e293b;
+                            Rectangle {
+                                width: parent.width * root.mirror_progress_fraction;
+                                height: 4px;
+                                border-radius: 2px;
+                                background: Theme.accent-cyan;
+                                animate width { duration: 150ms; }
+                            }
+                        }
+                        Text {
+                            text: root.mirror_status_text;
+                            font-size: 9px;
+                            color: Theme.text-muted;
+                            wrap: word-wrap;
+                        }
+                    }
+                    if root.mirror_worker_index == idx && !root.mirror_in_progress && root.mirror_status_text != "": Text {
+                        text: root.mirror_status_text;
+                        font-size: 9px;
+                        color: root.mirror_has_error ? #f87171 : Theme.accent-emerald;
+                        wrap: word-wrap;
+                    }
+                }
+            }
+
+            if root.workers.length == 0: Text {
+                text: "No remote workers configured yet -- renders stay local.";
+                font-size: 10px;
+                color: Theme.text-muted;
+                wrap: word-wrap;
+            }
+        }
+
+        Button {
+            text: "+ Add worker";
+            clicked => { root.open_add_form(); }
+        }
+
+        // Add / edit form.
+        if root.editing_index >= 0: VerticalLayout {
+            spacing: 6px;
+            Rectangle { height: 1px; background: #1e293b; }
+            Text { text: root.editing_index < root.workers.length ? "Edit worker" : "Add worker"; font-size: 11px; font-weight: 700; color: Theme.text-primary; }
+
+            LineEdit { placeholder-text: "Name (e.g. \"Office workstation\")"; text <=> root.form_name; }
+            LineEdit { placeholder-text: "Address (host:port)"; text <=> root.form_address; }
+            HorizontalLayout {
+                spacing: 6px;
+                LineEdit {
+                    placeholder-text: "Certificate bundle folder (ca.pem / client.pem / client.key)";
+                    text <=> root.form_cert_dir;
+                    horizontal-stretch: 1;
+                }
+                Button {
+                    text: "Browse...";
+                    clicked => { root.form_cert_dir = root.pick_cert_dir(root.form_cert_dir); }
+                }
+            }
+
+            // Token-based enrollment: redeem a one-time token from `gemray-worker cert
+            // issue-token` directly, instead of installing the worker binary and running
+            // `cert claim` in a terminal by hand. On success this fills in
+            // `form_cert_dir` above automatically (see `changed claimed_cert_dir`) --
+            // the manual field above it still works unchanged, for air-gapped setups
+            // with nothing to dial out to.
+            Text { text: "-- or redeem an enrollment token --"; font-size: 9px; color: Theme.text-muted; }
+            LineEdit {
+                placeholder-text: "Enrollment address (host:port, from \"cert issue-token\")";
+                text <=> root.form_enroll_addr;
+            }
+            HorizontalLayout {
+                spacing: 6px;
+                LineEdit {
+                    placeholder-text: "Token (GW1-...)";
+                    text <=> root.form_token;
+                    horizontal-stretch: 1;
+                }
+                Button {
+                    text: root.claiming_token ? "Redeeming..." : "Redeem";
+                    enabled: !root.claiming_token && root.form_token != "" && root.form_enroll_addr != "";
+                    clicked => {
+                        root.claim_token(root.editing_index, root.form_name, root.form_enroll_addr, root.form_token);
+                    }
+                }
+            }
+            if root.claim_result_index == root.editing_index && root.claim_result_text != "": Text {
+                text: root.claim_result_text;
+                font-size: 9px;
+                color: root.claim_result_is_error ? #f87171 : Theme.accent-emerald;
+                wrap: word-wrap;
+            }
+
+            HorizontalLayout {
+                spacing: 6px;
+                VerticalLayout {
+                    horizontal-stretch: 1;
+                    spacing: 2px;
+                    Text { text: "Transfer mode"; font-size: 9px; color: Theme.text-muted; }
+                    ComboBox { model: ["Live progressive", "Final only"]; current-index <=> root.form_transfer_mode_index; }
+                }
+                VerticalLayout {
+                    horizontal-stretch: 1;
+                    spacing: 2px;
+                    Text { text: "Cadence (ms)"; font-size: 9px; color: Theme.text-muted; }
+                    SpinBox { minimum: 50; maximum: 5000; step-size: 50; value <=> root.form_cadence_ms; }
+                }
+            }
+
+            HorizontalLayout {
+                spacing: 6px;
+                VerticalLayout {
+                    horizontal-stretch: 1;
+                    spacing: 2px;
+                    Text { text: "Preview scale"; font-size: 9px; color: Theme.text-muted; }
+                    ComboBox { model: ["Full", "Half", "Quarter", "Custom"]; current-index <=> root.form_preview_scale_index; }
+                }
+                if root.form_preview_scale_index == 3: VerticalLayout {
+                    horizontal-stretch: 1;
+                    spacing: 2px;
+                    Text { text: "Custom %"; font-size: 9px; color: Theme.text-muted; }
+                    SpinBox { minimum: 1; maximum: 100; step-size: 5; value <=> root.form_preview_scale_percent; }
+                }
+            }
+
+            HorizontalLayout {
+                spacing: 8px;
+                Button {
+                    text: "Cancel";
+                    horizontal-stretch: 1;
+                    clicked => { root.editing_index = -1; }
+                }
+                Button {
+                    text: "Save";
+                    horizontal-stretch: 1;
+                    primary: true;
+                    enabled: root.form_address != "";
+                    clicked => {
+                        root.save_worker(root.editing_index, {
+                            name: root.form_name,
+                            address: root.form_address,
+                            cert_dir: root.form_cert_dir,
+                            transfer_mode_index: root.form_transfer_mode_index,
+                            cadence_ms: root.form_cadence_ms,
+                            preview_scale_index: root.form_preview_scale_index,
+                            preview_scale_percent: root.form_preview_scale_percent,
+                        });
+                        root.editing_index = -1;
+                    }
+                }
+            }
+        }
+    }
+    }
+}

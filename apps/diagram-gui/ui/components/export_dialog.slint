@@ -1,0 +1,541 @@
+import { SpinBox, Slider } from "std-widgets.slint";
+import { Theme } from "../theme.slint";
+
+// High-resolution render export, independent of the viewport. Follows the
+// same modal-card conventions as `MaterialEditorDialog` (full-viewport backdrop +
+// centered card), the same segmented-pill selector style as `SettingsDialog`
+// (quality/bounce pickers) for output size, and the same labelled-value `Slider`
+// pattern as `MaterialEditorDialog`'s RI/dispersion/birefringence controls for the
+// sample count, whose useful range is too wide for a handful of pills.
+export component ExportDialog inherits Rectangle {
+    in-out property <int> selected_size_preset: 0; // 0: 1080p, 1: 4K, 2: Custom
+    in-out property <int> custom_width: 1920;
+    in-out property <int> custom_height: 1080;
+    // Continuous drag target for the sample-count slider below; `sample_exponent`
+    // rounds it to the nearest integer so the power-of-two math stays exact even
+    // mid-drag (`SliderBase` in std-widgets only snaps to `step` on arrow-key nudges,
+    // not on pointer drag -- see slint's widgets/common/slider-base.slint).
+    // 10.0 is the exponent for 1024, matching the old "High" preset's default.
+    in-out property <float> sample_exponent_raw: 10.0;
+    // Wide-gamut export: 0 = sRGB (default, untagged, byte-identical to
+    // exports made before this control existed), 1 = Display P3, 2 = Rec.2020 -- both
+    // wide-gamut choices get an embedded ICC profile (`bridge::icc_profile::build`) so
+    // the file is never silently misread as sRGB by a viewer. `ACEScg` deliberately
+    // has no pill here -- see the "Colour Space" section below for why a scene-linear
+    // space doesn't belong in an 8-bit PNG export.
+    in-out property <int> selected_color_space_index: 0;
+
+    // Compute target: 0 = Local only, 1 = Remote only, 2 = Local + Remote. Defaults to
+    // Local + Remote whenever a usable worker exists (`root.remote_available`),
+    // otherwise Local only -- matching `bridge::export_thread::run_export`'s own
+    // default split behaviour (see `gui::render_export`'s doc comment). This is a
+    // plain (non `in-out`) property bound to that default expression rather than a
+    // fixed initial value, so it re-evaluates every time `remote_available` changes --
+    // e.g. right after `check_remote_availability`'s background probe reports back,
+    // which happens every time this dialog opens (see `gem_viewport.slint`'s `changed
+    // export_open` handler) -- UNTIL the user clicks a pill, at which point Slint's own
+    // "an imperative assignment overrides a binding" rule takes over and this stops
+    // re-deriving from `remote_available` for the rest of this dialog instance's life.
+    property <int> compute_target: root.remote_available ? 2 : 0;
+    // Whether a configured worker was confirmed reachable and render-capable the last
+    // time `check_remote_availability` ran (see `gui::render_export`'s doc comment).
+    // `false` disables the Remote/Local+Remote pills below WITH a reason shown, never
+    // silently hides them.
+    in property <bool> remote_available: false;
+    // Human-readable reason `remote_available` is `false` -- distinguishes "no worker
+    // configured" / "worker unreachable" / "worker is library-only" (see
+    // `bridge::export_thread::remote::RemoteUnavailable::message`), rather than one
+    // generic "unavailable".
+    in property <string> remote_unavailable_reason: "";
+
+    in property <bool> is_exporting: false;
+    in property <float> export_progress: 0.0; // 0.0 .. 1.0
+    in property <string> export_status_message: "";
+    in property <bool> export_has_error: false;
+    // Live preview: a small in-progress thumbnail of the accumulation buffer, pushed
+    // alongside `export_progress` at up to ~2 updates/sec (see
+    // `bridge::export_thread::preview::PreviewThrottle`). `export_preview_samples_done`
+    // is also the "has a preview arrived yet" flag below -- 0 until the first tick.
+    in property <image> export_preview_image;
+    in property <int> export_preview_samples_done: 0;
+    in property <int> export_preview_samples_total: 0;
+
+    property <int> effective_width: root.selected_size_preset == 2 ? root.custom_width : (root.selected_size_preset == 1 ? 3840 : 1920);
+    property <int> effective_height: root.selected_size_preset == 2 ? root.custom_height : (root.selected_size_preset == 1 ? 2160 : 1080);
+    // Samples move in powers of two, not linearly: image noise falls as 1/sqrt(N), so
+    // a linear 8..32768 control would spend nearly all its travel in a range where
+    // each step looks visually identical. The slider drives this exponent (3..15);
+    // this is what's shown to the user and what lands in `default_export_path`'s
+    // `{spp}spp` filename segment.
+    property <int> sample_exponent: Math.round(root.sample_exponent_raw);
+    property <int> effective_samples: Math.round(Math.pow(2.0, root.sample_exponent));
+
+    callback close();
+    // width, height, samples-per-pixel, colour-space index (see
+    // `selected_color_space_index`'s own doc comment), compute-target index (see
+    // `compute_target`'s own doc comment)
+    callback start_export(int, int, int, int, int);
+    callback cancel_export();
+
+    // Full viewport modal backdrop
+    background: #00000088;
+
+    TouchArea {
+        clicked => { if (!root.is_exporting) { root.close(); } }
+    }
+
+    // Modal Card Container
+    Rectangle {
+        width: 420px;
+        // Content-driven height: without this, `Rectangle`'s default sizing ("expand to
+        // fill the parent" when width/height aren't both set explicitly) makes this card
+        // inherit the full-viewport backdrop's height -- i.e. it stretches to the bottom
+        // of the window instead of sizing to its content. Same idiom, and same reason, as
+        // `settings_dialog.slint` and `import_dialog.slint`.
+        height: content.preferred-height;
+        background: #11151f;
+        border-radius: Theme.radius-md;
+        border-width: 1px;
+        border-color: #334155;
+        drop-shadow-blur: 24px;
+        drop-shadow-color: #000000bb;
+        clip: true;
+
+        // Isolate clicks inside modal
+        TouchArea {}
+
+        content := VerticalLayout {
+            padding: 16px;
+            spacing: 14px;
+
+            // 1. Header Bar
+            HorizontalLayout {
+                alignment: space-between;
+
+                HorizontalLayout {
+                    spacing: 8px;
+                    Image { source: @image-url("../icons/save.svg"); colorize: Theme.text-primary; width: 15px; height: 15px; vertical-alignment: center; }
+                    Text {
+                        text: "Export High-Resolution Render";
+                        font-size: 14px;
+                        font-weight: 700;
+                        color: Theme.text-primary;
+                        vertical-alignment: center;
+                    }
+                }
+
+                Rectangle {
+                    width: 24px;
+                    height: 24px;
+                    border-radius: Theme.radius-sm;
+                    background: close_touch.has-hover ? #2d3748 : #1a202c;
+
+                    close_touch := TouchArea {
+                        clicked => { if (!root.is_exporting) { root.close(); } }
+                    }
+
+                    Image {
+                        source: @image-url("../icons/close.svg");
+                        colorize: Theme.text-muted;
+                        width: 12px;
+                        height: 12px;
+                        horizontal-alignment: center;
+                        vertical-alignment: center;
+                    }
+                }
+            }
+
+            Rectangle { height: 1px; background: #1e293b; }
+
+            // 2. Output Size
+            VerticalLayout {
+                spacing: 6px;
+                Text { text: "Output Size"; font-size: 11px; font-weight: 600; color: Theme.text-secondary; }
+
+                HorizontalLayout {
+                    spacing: 4px;
+
+                    Rectangle {
+                        horizontal-stretch: 1;
+                        height: 28px;
+                        border-radius: Theme.radius-sm;
+                        background: root.selected_size_preset == 0 ? Theme.accent-cyan : (sz0_touch.has-hover ? #1e293b : #0f172a);
+                        border-width: 1px;
+                        border-color: root.selected_size_preset == 0 ? Theme.accent-cyan : #334155;
+
+                        sz0_touch := TouchArea {
+                            enabled: !root.is_exporting;
+                            clicked => { root.selected_size_preset = 0; }
+                        }
+
+                        Text { text: "1080p"; font-size: 11px; font-weight: 600; color: root.selected_size_preset == 0 ? #0f172a : Theme.text-secondary; horizontal-alignment: center; vertical-alignment: center; }
+                    }
+
+                    Rectangle {
+                        horizontal-stretch: 1;
+                        height: 28px;
+                        border-radius: Theme.radius-sm;
+                        background: root.selected_size_preset == 1 ? Theme.accent-cyan : (sz1_touch.has-hover ? #1e293b : #0f172a);
+                        border-width: 1px;
+                        border-color: root.selected_size_preset == 1 ? Theme.accent-cyan : #334155;
+
+                        sz1_touch := TouchArea {
+                            enabled: !root.is_exporting;
+                            clicked => { root.selected_size_preset = 1; }
+                        }
+
+                        Text { text: "4K"; font-size: 11px; font-weight: 600; color: root.selected_size_preset == 1 ? #0f172a : Theme.text-secondary; horizontal-alignment: center; vertical-alignment: center; }
+                    }
+
+                    Rectangle {
+                        horizontal-stretch: 1;
+                        height: 28px;
+                        border-radius: Theme.radius-sm;
+                        background: root.selected_size_preset == 2 ? Theme.accent-cyan : (sz2_touch.has-hover ? #1e293b : #0f172a);
+                        border-width: 1px;
+                        border-color: root.selected_size_preset == 2 ? Theme.accent-cyan : #334155;
+
+                        sz2_touch := TouchArea {
+                            enabled: !root.is_exporting;
+                            clicked => { root.selected_size_preset = 2; }
+                        }
+
+                        Text { text: "Custom"; font-size: 11px; font-weight: 600; color: root.selected_size_preset == 2 ? #0f172a : Theme.text-secondary; horizontal-alignment: center; vertical-alignment: center; }
+                    }
+                }
+
+                if root.selected_size_preset == 2: HorizontalLayout {
+                    spacing: 10px;
+
+                    VerticalLayout {
+                        horizontal-stretch: 1;
+                        spacing: 2px;
+                        Text { text: "Width (px)"; font-size: 10px; color: Theme.text-muted; }
+                        SpinBox { minimum: 16; maximum: 8192; step-size: 8; value <=> root.custom_width; enabled: !root.is_exporting; }
+                    }
+
+                    VerticalLayout {
+                        horizontal-stretch: 1;
+                        spacing: 2px;
+                        Text { text: "Height (px)"; font-size: 10px; color: Theme.text-muted; }
+                        SpinBox { minimum: 16; maximum: 8192; step-size: 8; value <=> root.custom_height; enabled: !root.is_exporting; }
+                    }
+                }
+
+                Text { text: root.effective_width + " x " + root.effective_height + " px"; font-size: 10px; color: Theme.text-muted; }
+            }
+
+            // 2b. Colour Space: sRGB stays the default -- untagged, and the
+            // only choice byte-identical to an export made before this control
+            // existed. Display P3 / Rec.2020 are wider gamuts (particularly red/green,
+            // exactly where gemstone dispersion "fire" lands) tagged with an embedded
+            // ICC profile so they display correctly instead of looking washed-out (an
+            // untagged wide-gamut PNG is read as sRGB by every viewer). `ACEScg` is
+            // deliberately not offered: it is scene-linear with no transfer function,
+            // meant for further compositing in a floating-point/high-bit-depth
+            // pipeline -- quantizing scene-linear light straight to 8-bit PNG would
+            // concentrate almost the whole visible range into a handful of the darkest
+            // code values, severe banding that a transfer curve like sRGB's or
+            // Rec.2020's exists specifically to avoid.
+            VerticalLayout {
+                spacing: 6px;
+                Text { text: "Colour Space"; font-size: 11px; font-weight: 600; color: Theme.text-secondary; }
+
+                HorizontalLayout {
+                    spacing: 4px;
+
+                    Rectangle {
+                        horizontal-stretch: 1;
+                        height: 28px;
+                        border-radius: Theme.radius-sm;
+                        background: root.selected_color_space_index == 0 ? Theme.accent-cyan : (cs0_touch.has-hover ? #1e293b : #0f172a);
+                        border-width: 1px;
+                        border-color: root.selected_color_space_index == 0 ? Theme.accent-cyan : #334155;
+
+                        cs0_touch := TouchArea {
+                            enabled: !root.is_exporting;
+                            clicked => { root.selected_color_space_index = 0; }
+                        }
+
+                        Text { text: "sRGB"; font-size: 11px; font-weight: 600; color: root.selected_color_space_index == 0 ? #0f172a : Theme.text-secondary; horizontal-alignment: center; vertical-alignment: center; }
+                    }
+
+                    Rectangle {
+                        horizontal-stretch: 1;
+                        height: 28px;
+                        border-radius: Theme.radius-sm;
+                        background: root.selected_color_space_index == 1 ? Theme.accent-cyan : (cs1_touch.has-hover ? #1e293b : #0f172a);
+                        border-width: 1px;
+                        border-color: root.selected_color_space_index == 1 ? Theme.accent-cyan : #334155;
+
+                        cs1_touch := TouchArea {
+                            enabled: !root.is_exporting;
+                            clicked => { root.selected_color_space_index = 1; }
+                        }
+
+                        Text { text: "Display P3"; font-size: 11px; font-weight: 600; color: root.selected_color_space_index == 1 ? #0f172a : Theme.text-secondary; horizontal-alignment: center; vertical-alignment: center; }
+                    }
+
+                    Rectangle {
+                        horizontal-stretch: 1;
+                        height: 28px;
+                        border-radius: Theme.radius-sm;
+                        background: root.selected_color_space_index == 2 ? Theme.accent-cyan : (cs2_touch.has-hover ? #1e293b : #0f172a);
+                        border-width: 1px;
+                        border-color: root.selected_color_space_index == 2 ? Theme.accent-cyan : #334155;
+
+                        cs2_touch := TouchArea {
+                            enabled: !root.is_exporting;
+                            clicked => { root.selected_color_space_index = 2; }
+                        }
+
+                        Text { text: "Rec.2020"; font-size: 11px; font-weight: 600; color: root.selected_color_space_index == 2 ? #0f172a : Theme.text-secondary; horizontal-alignment: center; vertical-alignment: center; }
+                    }
+                }
+
+                if root.selected_color_space_index != 0: Text {
+                    text: "Wider gamut, tagged with an embedded colour profile so viewers display it correctly.";
+                    font-size: 9px;
+                    color: Theme.text-muted;
+                    wrap: word-wrap;
+                }
+            }
+
+            // 2c. Compute target: which engine(s) trace this export. Same segmented-
+            // pill idiom as "Output Size"/"Colour Space" above -- the Remote/Local+Remote
+            // pills are disabled (not hidden) with `remote_unavailable_reason` shown
+            // beneath whenever `!root.remote_available`, so a user without a worker
+            // configured always sees WHY those choices aren't offered right now.
+            VerticalLayout {
+                spacing: 6px;
+                Text { text: "Compute"; font-size: 11px; font-weight: 600; color: Theme.text-secondary; }
+
+                HorizontalLayout {
+                    spacing: 4px;
+
+                    Rectangle {
+                        horizontal-stretch: 1;
+                        height: 28px;
+                        border-radius: Theme.radius-sm;
+                        background: root.compute_target == 0 ? Theme.accent-cyan : (ct0_touch.has-hover ? #1e293b : #0f172a);
+                        border-width: 1px;
+                        border-color: root.compute_target == 0 ? Theme.accent-cyan : #334155;
+
+                        ct0_touch := TouchArea {
+                            enabled: !root.is_exporting;
+                            clicked => { root.compute_target = 0; }
+                        }
+
+                        Text { text: "Local only"; font-size: 11px; font-weight: 600; color: root.compute_target == 0 ? #0f172a : Theme.text-secondary; horizontal-alignment: center; vertical-alignment: center; }
+                    }
+
+                    Rectangle {
+                        horizontal-stretch: 1;
+                        height: 28px;
+                        border-radius: Theme.radius-sm;
+                        opacity: root.remote_available ? 1.0 : 0.45;
+                        background: root.compute_target == 1 ? Theme.accent-cyan : (ct1_touch.has-hover ? #1e293b : #0f172a);
+                        border-width: 1px;
+                        border-color: root.compute_target == 1 ? Theme.accent-cyan : #334155;
+
+                        ct1_touch := TouchArea {
+                            enabled: !root.is_exporting && root.remote_available;
+                            clicked => { root.compute_target = 1; }
+                        }
+
+                        Text { text: "Remote only"; font-size: 11px; font-weight: 600; color: root.compute_target == 1 ? #0f172a : Theme.text-secondary; horizontal-alignment: center; vertical-alignment: center; }
+                    }
+
+                    Rectangle {
+                        horizontal-stretch: 1;
+                        height: 28px;
+                        border-radius: Theme.radius-sm;
+                        opacity: root.remote_available ? 1.0 : 0.45;
+                        background: root.compute_target == 2 ? Theme.accent-cyan : (ct2_touch.has-hover ? #1e293b : #0f172a);
+                        border-width: 1px;
+                        border-color: root.compute_target == 2 ? Theme.accent-cyan : #334155;
+
+                        ct2_touch := TouchArea {
+                            enabled: !root.is_exporting && root.remote_available;
+                            clicked => { root.compute_target = 2; }
+                        }
+
+                        Text { text: "Local + Remote"; font-size: 11px; font-weight: 600; color: root.compute_target == 2 ? #0f172a : Theme.text-secondary; horizontal-alignment: center; vertical-alignment: center; }
+                    }
+                }
+
+                if !root.remote_available: Text {
+                    text: root.remote_unavailable_reason == "" ? "Checking for a remote worker..." : root.remote_unavailable_reason;
+                    font-size: 9px;
+                    color: Theme.text-muted;
+                    wrap: word-wrap;
+                }
+            }
+
+            // 3. Sample Count -- a power-of-two slider rather than pills, since the
+            // useful range (8..32768) is now far too wide for a handful of presets.
+            // "higher = slower" is honest at 4096 but understates it badly at 32768,
+            // hence the plain-language cost hint that appears near the top of the range.
+            VerticalLayout {
+                spacing: 6px;
+                Text { text: "Sample Count (higher = slower, smoother)"; font-size: 11px; font-weight: 600; color: Theme.text-secondary; }
+
+                HorizontalLayout {
+                    alignment: space-between;
+                    Text { text: "Samples per pixel:"; font-size: 10px; color: Theme.text-muted; vertical-alignment: center; }
+                    Text { text: root.effective_samples; font-size: 13px; font-weight: 700; color: Theme.accent-cyan; }
+                }
+
+                Slider {
+                    minimum: 3;
+                    maximum: 15;
+                    step: 1;
+                    value <=> root.sample_exponent_raw;
+                    enabled: !root.is_exporting;
+                }
+
+                if root.sample_exponent >= 14: Text {
+                    text: "Very high sample counts can take hours to render, especially at large output sizes.";
+                    font-size: 9px;
+                    color: Theme.text-muted;
+                    wrap: word-wrap;
+                }
+            }
+
+            Rectangle { height: 1px; background: #1e293b; }
+
+            // 4. Progress (visible only while exporting) -- keeps the user informed
+            // during what can be a multi-minute render (Task: "a frozen UI with no
+            // feedback is unacceptable").
+            if root.is_exporting: VerticalLayout {
+                spacing: 6px;
+
+                // Live preview -- fixed-height reserved slot (present for the whole
+                // "is_exporting" section, not just once a thumbnail exists) so the card
+                // never resizes when the first preview tick lands; `image-fit: contain`
+                // keeps the thumbnail at the export's own aspect ratio inside it rather
+                // than stretching to the box's (usually different) aspect ratio.
+                Rectangle {
+                    height: 200px;
+                    border-radius: Theme.radius-sm;
+                    background: #0f172a;
+                    border-width: 1px;
+                    border-color: #334155;
+                    clip: true;
+
+                    if root.export_preview_samples_done > 0: Image {
+                        source: root.export_preview_image;
+                        image-fit: contain;
+                        width: 100%;
+                        height: 100%;
+                    }
+
+                    if root.export_preview_samples_done <= 0: Text {
+                        width: 100%;
+                        height: 100%;
+                        text: "Preview appears shortly...";
+                        font-size: 10px;
+                        color: Theme.text-muted;
+                        horizontal-alignment: center;
+                        vertical-alignment: center;
+                    }
+                }
+
+                Text {
+                    text: root.export_preview_samples_done > 0
+                        ? "Preview (in progress, not the final file) · " + root.export_preview_samples_done + " / " + root.export_preview_samples_total + " samples"
+                        : "Preview";
+                    font-size: 9px;
+                    color: Theme.text-muted;
+                    horizontal-alignment: center;
+                }
+
+                HorizontalLayout {
+                    alignment: space-between;
+                    Text { text: "Rendering..."; font-size: 11px; font-weight: 600; color: Theme.text-secondary; }
+                    Text { text: Math.round(root.export_progress * 100) + "%"; font-size: 11px; font-weight: 700; color: Theme.accent-cyan; }
+                }
+                Rectangle {
+                    height: 8px;
+                    border-radius: 4px;
+                    background: #0f172a;
+                    border-width: 1px;
+                    border-color: #334155;
+                    clip: true;
+
+                    Rectangle {
+                        x: 0;
+                        y: 0;
+                        width: parent.width * root.export_progress;
+                        height: 100%;
+                        background: Theme.accent-cyan;
+                        animate width { duration: 150ms; }
+                    }
+                }
+            }
+
+            // 5. Result / error message, shown once the export finishes
+            if !root.is_exporting && root.export_status_message != "": Text {
+                text: root.export_status_message;
+                font-size: 10px;
+                color: root.export_has_error ? #f87171 : Theme.accent-emerald;
+                wrap: word-wrap;
+            }
+
+            // 6. Footer Actions
+            HorizontalLayout {
+                spacing: 8px;
+
+                if root.is_exporting: Rectangle {
+                    horizontal-stretch: 1;
+                    height: 32px;
+                    border-radius: Theme.radius-sm;
+                    background: cancel_touch.has-hover ? #450a0a : #1f1111;
+                    border-width: 1px;
+                    border-color: #7f1d1d;
+
+                    cancel_touch := TouchArea {
+                        clicked => { root.cancel_export(); }
+                    }
+
+                    Text { text: "Cancel Export"; font-size: 11px; font-weight: 600; color: #f87171; horizontal-alignment: center; vertical-alignment: center; }
+                }
+
+                if !root.is_exporting: Rectangle {
+                    width: 90px;
+                    height: 32px;
+                    border-radius: Theme.radius-sm;
+                    background: close2_touch.has-hover ? #1e293b : #0f172a;
+                    border-width: 1px;
+                    border-color: #334155;
+
+                    close2_touch := TouchArea {
+                        clicked => { root.close(); }
+                    }
+
+                    Text { text: "Close"; font-size: 11px; font-weight: 600; color: Theme.text-secondary; horizontal-alignment: center; vertical-alignment: center; }
+                }
+
+                if !root.is_exporting: Rectangle {
+                    horizontal-stretch: 1;
+                    height: 32px;
+                    border-radius: Theme.radius-sm;
+                    background: start_touch.has-hover ? #7dd3fc : Theme.accent-cyan;
+
+                    start_touch := TouchArea {
+                        clicked => {
+                            root.start_export(root.effective_width, root.effective_height, root.effective_samples, root.selected_color_space_index, root.compute_target);
+                        }
+                    }
+
+                    HorizontalLayout {
+                        alignment: center;
+                        spacing: 6px;
+                        Image { source: @image-url("../icons/save.svg"); colorize: #0f172a; width: 12px; height: 12px; vertical-alignment: center; }
+                        Text { text: "Start Export"; font-size: 12px; font-weight: 700; color: #0f172a; vertical-alignment: center; }
+                    }
+                }
+            }
+        }
+    }
+}

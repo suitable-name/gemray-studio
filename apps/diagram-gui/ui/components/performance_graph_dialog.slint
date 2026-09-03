@@ -1,0 +1,777 @@
+import { Button } from "std-widgets.slint";
+import { Theme } from "../theme.slint";
+
+export component PerformanceGraphDialog inherits Rectangle {
+    // Azimuth-0 ("canonical") sweep -- see `graph_*_extra_axes` below for the other
+    // three. Kept as its own flat property (rather than folded into a 4-row array)
+    // because `settings_dialog.slint`'s own mini tilt chart also binds to this exact
+    // property forwarded from `GemViewportView`/`MainWindow`; this dialog must not
+    // change what it means.
+    in property <[float]> graph_brilliance: [20.0, 25.0, 32.0, 42.0, 50.0, 58.0, 65.0, 72.0, 78.0, 82.0, 84.0, 85.0, 84.0, 82.0, 80.0, 76.0, 70.0, 62.0, 50.0];
+    in property <[float]> graph_extinction: [65.0, 58.0, 50.0, 40.0, 32.0, 25.0, 18.0, 14.0, 10.0, 8.0, 6.0, 5.0, 6.0, 7.0, 9.0, 12.0, 18.0, 26.0, 38.0];
+    in property <[float]> graph_windowing: [40.0, 35.0, 28.0, 20.0, 15.0, 10.0, 8.0, 6.0, 5.0, 4.0, 4.0, 5.0, 6.0, 8.0, 10.0, 14.0, 18.0, 24.0, 30.0];
+    // SVG path-data strings (`M x y L x y ...`) for the same three curves, built by
+    // `curve_path::tilt_curve_path` in a 0..100 x 0..100 viewbox -- see the chart
+    // canvas section below for how the viewbox maps onto the plot area.
+    in property <string> graph_brilliance_path: "";
+    in property <string> graph_extinction_path: "";
+    in property <string> graph_windowing_path: "";
+    // The other three camera azimuths (45/90/135 deg -- see `gemray::color::metrics::
+    // PROFILE_AZIMUTHS_DEG`), one row per azimuth, computed lazily off the UI thread
+    // by `gui::tilt_profile` only while this dialog is open (four times the analytic
+    // raytracing of a single sweep is not something to pay on every render frame --
+    // see that module's doc comment). Empty until that computation finishes; use
+    // `extra_axes_ready` rather than assuming a length of 3.
+    in property <[[float]]> graph_brilliance_extra_axes: [];
+    in property <[[float]]> graph_extinction_extra_axes: [];
+    in property <[[float]]> graph_windowing_extra_axes: [];
+    in property <[string]> graph_brilliance_extra_paths: [];
+    in property <[string]> graph_extinction_extra_paths: [];
+    in property <[string]> graph_windowing_extra_paths: [];
+    in property <bool> extra_axes_loading: false;
+    in property <[string]> graph_angles: ["0", "5", "10", "15", "20", "25", "30", "35", "40", "45", "50", "55", "60", "65", "70", "75", "80", "85", "90"];
+    in property <[float]> graph_angles_num: [0.0, 5.0, 10.0, 15.0, 20.0, 25.0, 30.0, 35.0, 40.0, 45.0, 50.0, 55.0, 60.0, 65.0, 70.0, 75.0, 80.0, 85.0, 90.0];
+    in property <float> cam_pitch_deg: 45.0;
+    in property <string> material_name: "Diamond";
+
+    in-out property <bool> show_brilliance: true;
+    in-out property <bool> show_windowing: true;
+    in-out property <bool> show_extinction: true;
+
+    // Which of the four camera azimuths is plotted: 0 = canonical (`graph_brilliance`
+    // etc.), 1..3 index into `graph_*_extra_axes[selected_axis_index - 1]`. Dialog-
+    // local UI state -- not forwarded from Rust, unlike the channel toggles above,
+    // since nothing outside this dialog needs to know which axis is on screen.
+    in-out property <int> selected_axis_index: 0;
+    // "All" overlay: draws all four azimuth sweeps of every visible channel at once,
+    // fading every axis except `selected_axis_index` -- see the chart canvas section.
+    in-out property <bool> show_all_axes: false;
+    property <[string]> axis_labels: ["0° (length)", "45°", "90° (width)", "135°"];
+    property <string> selected_axis_label: root.axis_labels[root.selected_axis_index];
+    // True once all three extra-azimuth sweeps have actually arrived -- guards both
+    // the axis pills (disabled/dimmed until then, except axis 0 which is always
+    // available) and `active_*_values`/`active_*_path` below against indexing an
+    // empty `graph_*_extra_axes` row while `extra_axes_loading` is still in flight.
+    property <bool> extra_axes_ready: root.graph_brilliance_extra_axes.length >= 3
+        && root.graph_extinction_extra_axes.length >= 3
+        && root.graph_windowing_extra_axes.length >= 3;
+
+    // The currently-selected axis's data, in the flat shape the summary badges and
+    // the hover tooltip's interpolation both want. Falls back to the always-available
+    // azimuth-0 data rather than an empty array if a non-zero axis is somehow selected
+    // before `extra_axes_ready` -- belt-and-suspenders alongside the axis pills' own
+    // `enabled` gating below.
+    property <[float]> active_brilliance_values: (root.selected_axis_index == 0 || !root.extra_axes_ready)
+        ? root.graph_brilliance : root.graph_brilliance_extra_axes[root.selected_axis_index - 1];
+    property <[float]> active_extinction_values: (root.selected_axis_index == 0 || !root.extra_axes_ready)
+        ? root.graph_extinction : root.graph_extinction_extra_axes[root.selected_axis_index - 1];
+    property <[float]> active_windowing_values: (root.selected_axis_index == 0 || !root.extra_axes_ready)
+        ? root.graph_windowing : root.graph_windowing_extra_axes[root.selected_axis_index - 1];
+    property <string> active_brilliance_path: (root.selected_axis_index == 0 || !root.extra_axes_ready)
+        ? root.graph_brilliance_path : root.graph_brilliance_extra_paths[root.selected_axis_index - 1];
+    property <string> active_extinction_path: (root.selected_axis_index == 0 || !root.extra_axes_ready)
+        ? root.graph_extinction_path : root.graph_extinction_extra_paths[root.selected_axis_index - 1];
+    property <string> active_windowing_path: (root.selected_axis_index == 0 || !root.extra_axes_ready)
+        ? root.graph_windowing_path : root.graph_windowing_extra_paths[root.selected_axis_index - 1];
+
+    // Linear interpolation between the two 5°-spaced measured samples straddling
+    // `tilt_deg`, for reading the curve at finer-than-measured resolution (the hover
+    // tooltip's 101-stop, ~0.9°-apart readout -- see the chart canvas section).
+    // HONESTY: everything this returns between the 19 actually-measured angles is
+    // INTERPOLATED, not traced -- see the dialog's subtitle caption, which says so to
+    // the user, and `copy_curve_data`'s CSV export, which is the escape hatch to the
+    // real, measured-only numbers.
+    pure function interpolated_value(values: [float], tilt_deg: float) -> float {
+        if values.length < 19 {
+            return 0.0;
+        }
+        let clamped: float = Math.max(0.0, Math.min(90.0, tilt_deg));
+        let lower_idx: int = Math.max(0, Math.min(18, Math.floor(clamped / 5.0)));
+        if lower_idx >= 18 {
+            return values[18];
+        }
+        let frac: float = (clamped - lower_idx * 5.0) / 5.0;
+        return values[lower_idx] * (1.0 - frac) + values[lower_idx + 1] * frac;
+    }
+
+    // Snaps a horizontal pixel offset within the plot to one of 101 stops evenly
+    // spaced across the 0..90 deg tilt range (~0.9 deg apart) -- "1% steps" per the
+    // dialog's hover-tooltip requirement.
+    pure function snap_tilt_deg(mouse_x: length, plot_width: length) -> float {
+        let frac: float = Math.max(0.0, Math.min(1.0, mouse_x / plot_width));
+        let step: float = 90.0 / 100.0;
+        return Math.round(frac * 90.0 / step) * step;
+    }
+
+    callback close();
+    callback copy_curve_data();
+
+    // Full Viewport Modal Backdrop
+    background: #00000088;
+
+    TouchArea {
+        clicked => { root.close(); }
+    }
+
+    // Modal Card Container. Sized off the backdrop (`root`, which `gem_viewport.slint`
+    // pins to the full viewport) rather than a fixed pixel width -- see Problem 1's
+    // fix in the chart canvas section below for why a fixed width used to matter here
+    // too: this card no longer needs to be narrow to hide the plot's old
+    // narrower-than-its-box symptom, so it can size to actually use the space.
+    Rectangle {
+        width: Math.min(960px, root.width - 80px);
+        // Content-driven height: without this, `Rectangle`'s default sizing ("expand to
+        // fill the parent" when width/height aren't both set explicitly -- see
+        // `settings_dialog.slint`'s doc comment for the full mechanism) makes this card
+        // inherit the height of the full-viewport backdrop it's anchored inside -- i.e.
+        // it stretches down to the bottom of the app instead of sizing to its content.
+        height: content.preferred-height;
+        background: #0f1523;
+        border-radius: Theme.radius-lg;
+        border-width: 1px;
+        border-color: #334155;
+        drop-shadow-blur: 32px;
+        drop-shadow-color: #000000ee;
+        drop-shadow-offset-y: 8px;
+        clip: true;
+
+        // Isolate clicks inside modal card
+        TouchArea {}
+
+        content := VerticalLayout {
+            padding: 18px;
+            spacing: 14px;
+
+            // 1. Header Bar
+            HorizontalLayout {
+                alignment: space-between;
+
+                VerticalLayout {
+                    spacing: 3px;
+                    HorizontalLayout {
+                        spacing: 8px;
+                        Image { source: @image-url("../icons/trend-up.svg"); colorize: Theme.text-primary; width: 16px; height: 16px; vertical-alignment: center; }
+                        Text {
+                            text: "Tilt Performance Curve Analysis";
+                            font-size: 15px;
+                            font-weight: 700;
+                            color: Theme.text-primary;
+                            vertical-alignment: center;
+                        }
+                    }
+                    Text {
+                        text: "Analytical raytracing across 0° to 90° Point of View tilt angles (5° step resolution) for " + root.material_name;
+                        font-size: 11px;
+                        color: Theme.text-muted;
+                    }
+                    // HONESTY: the 19 markers above are the only MEASURED points on
+                    // this chart -- everything the curve and the hover tooltip show
+                    // between them (see `interpolated_value` below) is linearly
+                    // interpolated, not additional raytracing. Said here rather than
+                    // only in a code comment because the tooltip itself reads like a
+                    // precise instrument readout, and that impression would be
+                    // misleading without this caption.
+                    Text {
+                        text: "Between the 19 measured 5°-step points, the curve and hover readout are linearly interpolated, not additional raytracing.";
+                        font-size: 9.5px;
+                        font-italic: true;
+                        color: #475569;
+                    }
+                }
+
+                Rectangle {
+                    width: 26px;
+                    height: 26px;
+                    border-radius: 13px;
+                    background: close_touch.has-hover ? #1e293b : transparent;
+
+                    close_touch := TouchArea {
+                        clicked => { root.close(); }
+                    }
+
+                    Image {
+                        source: @image-url("../icons/close.svg");
+                        colorize: Theme.text-muted;
+                        width: 13px;
+                        height: 13px;
+                        horizontal-alignment: center;
+                        vertical-alignment: center;
+                    }
+                }
+            }
+
+            Rectangle { height: 1px; background: #1e293b; }
+
+            // 2. Key Performance Metric Badges
+            HorizontalLayout {
+                spacing: 10px;
+
+                // Face-Up Brilliance
+                Rectangle {
+                    horizontal-stretch: 1;
+                    height: 52px;
+                    background: #131b2e;
+                    border-radius: Theme.radius-sm;
+                    border-width: 1px;
+                    border-color: #1e293b;
+
+                    VerticalLayout {
+                        padding: 8px;
+                        alignment: center;
+                        spacing: 2px;
+                        Text { text: "Face-Up Brilliance (90°, " + root.selected_axis_label + ")"; font-size: 10px; font-weight: 600; color: Theme.text-muted; }
+                        Text {
+                            text: Math.round(root.active_brilliance_values[18]) + "%";
+                            font-size: 16px;
+                            font-weight: 700;
+                            color: Theme.accent-cyan;
+                        }
+                    }
+                }
+
+                // Face-Up Windowing
+                Rectangle {
+                    horizontal-stretch: 1;
+                    height: 52px;
+                    background: #131b2e;
+                    border-radius: Theme.radius-sm;
+                    border-width: 1px;
+                    border-color: #1e293b;
+
+                    VerticalLayout {
+                        padding: 8px;
+                        alignment: center;
+                        spacing: 2px;
+                        Text { text: "Face-Up Windowing (90°, " + root.selected_axis_label + ")"; font-size: 10px; font-weight: 600; color: Theme.text-muted; }
+                        Text {
+                            text: Math.round(root.active_windowing_values[18]) + "%";
+                            font-size: 16px;
+                            font-weight: 700;
+                            color: Theme.accent-amber;
+                        }
+                    }
+                }
+
+                // Tilt Extinction
+                Rectangle {
+                    horizontal-stretch: 1;
+                    height: 52px;
+                    background: #131b2e;
+                    border-radius: Theme.radius-sm;
+                    border-width: 1px;
+                    border-color: #1e293b;
+
+                    VerticalLayout {
+                        padding: 8px;
+                        alignment: center;
+                        spacing: 2px;
+                        Text { text: "Extinction Shadow (90°, " + root.selected_axis_label + ")"; font-size: 10px; font-weight: 600; color: Theme.text-muted; }
+                        Text {
+                            text: Math.round(root.active_extinction_values[18]) + "%";
+                            font-size: 16px;
+                            font-weight: 700;
+                            color: #ef4444;
+                        }
+                    }
+                }
+            }
+
+            // 3. Channel Toggle Filters
+            HorizontalLayout {
+                alignment: space-between;
+
+                Text {
+                    text: "Optical Channels:";
+                    font-size: 11px;
+                    font-weight: 600;
+                    color: Theme.text-secondary;
+                    vertical-alignment: center;
+                }
+
+                HorizontalLayout {
+                    spacing: 8px;
+
+                    // Brilliance Channel Toggle
+                    Rectangle {
+                        height: 24px;
+                        border-radius: Theme.radius-sm;
+                        background: root.show_brilliance ? #0284c733 : #0f172a;
+                        border-width: 1px;
+                        border-color: root.show_brilliance ? Theme.accent-cyan : #334155;
+
+                        TouchArea {
+                            clicked => { root.show_brilliance = !root.show_brilliance; }
+                        }
+
+                        HorizontalLayout {
+                            padding-left: 8px;
+                            padding-right: 8px;
+                            spacing: 5px;
+                            alignment: center;
+                            Rectangle { width: 7px; height: 7px; border-radius: 3px; background: Theme.accent-cyan; }
+                            Text { text: "Brilliance % (Light Return)"; font-size: 10px; font-weight: 600; color: root.show_brilliance ? Theme.accent-cyan : Theme.text-muted; }
+                        }
+                    }
+
+                    // Windowing Channel Toggle
+                    Rectangle {
+                        height: 24px;
+                        border-radius: Theme.radius-sm;
+                        background: root.show_windowing ? #d9770633 : #0f172a;
+                        border-width: 1px;
+                        border-color: root.show_windowing ? Theme.accent-amber : #334155;
+
+                        TouchArea {
+                            clicked => { root.show_windowing = !root.show_windowing; }
+                        }
+
+                        HorizontalLayout {
+                            padding-left: 8px;
+                            padding-right: 8px;
+                            spacing: 5px;
+                            alignment: center;
+                            Rectangle { width: 7px; height: 7px; border-radius: 3px; background: Theme.accent-amber; }
+                            Text { text: "Windowing % (TIR Leakage)"; font-size: 10px; font-weight: 600; color: root.show_windowing ? Theme.accent-amber : Theme.text-muted; }
+                        }
+                    }
+
+                    // Extinction Channel Toggle
+                    Rectangle {
+                        height: 24px;
+                        border-radius: Theme.radius-sm;
+                        background: root.show_extinction ? #b91c1c33 : #0f172a;
+                        border-width: 1px;
+                        border-color: root.show_extinction ? #ef4444 : #334155;
+
+                        TouchArea {
+                            clicked => { root.show_extinction = !root.show_extinction; }
+                        }
+
+                        HorizontalLayout {
+                            padding-left: 8px;
+                            padding-right: 8px;
+                            spacing: 5px;
+                            alignment: center;
+                            Rectangle { width: 7px; height: 7px; border-radius: 3px; background: #ef4444; }
+                            Text { text: "Extinction % (Shadows)"; font-size: 10px; font-weight: 600; color: root.show_extinction ? #ef4444 : Theme.text-muted; }
+                        }
+                    }
+                }
+            }
+
+            // 3.5. Tilt Axis Switcher -- see `PROFILE_AZIMUTHS_DEG` in
+            // `gemray::color::metrics` for what each azimuth physically means. Styled
+            // to match the "Optical Channels" pills above, but in purple rather than
+            // per-channel colour so the two rows read as separate axes of control
+            // (WHICH channels vs. WHICH sweep) rather than one long list of options.
+            HorizontalLayout {
+                alignment: space-between;
+
+                HorizontalLayout {
+                    spacing: 6px;
+                    Text {
+                        text: "Tilt Axis:";
+                        font-size: 11px;
+                        font-weight: 600;
+                        color: Theme.text-secondary;
+                        vertical-alignment: center;
+                    }
+                    if root.extra_axes_loading: Text {
+                        text: "(computing other axes...)";
+                        font-size: 10px;
+                        font-italic: true;
+                        color: Theme.text-muted;
+                        vertical-alignment: center;
+                    }
+                }
+
+                HorizontalLayout {
+                    spacing: 6px;
+
+                    for label[idx] in root.axis_labels : Rectangle {
+                        height: 24px;
+                        border-radius: Theme.radius-sm;
+                        background: root.selected_axis_index == idx ? #a855f733 : #0f172a;
+                        border-width: 1px;
+                        border-color: root.selected_axis_index == idx ? Theme.accent-purple : #334155;
+                        // Axes 1..3 need `extra_axes_ready`'s background sweep to have
+                        // landed -- axis 0 (the canonical sweep) is always available,
+                        // it's what the render thread already computes every frame.
+                        opacity: (idx == 0 || root.extra_axes_ready) ? 1.0 : 0.4;
+
+                        TouchArea {
+                            clicked => {
+                                if idx == 0 || root.extra_axes_ready {
+                                    root.selected_axis_index = idx;
+                                }
+                            }
+                        }
+
+                        HorizontalLayout {
+                            padding-left: 8px;
+                            padding-right: 8px;
+                            alignment: center;
+                            Text {
+                                text: label;
+                                font-size: 10px;
+                                font-weight: 600;
+                                color: root.selected_axis_index == idx ? Theme.accent-purple : Theme.text-muted;
+                            }
+                        }
+                    }
+
+                    // "All" overlay toggle -- draws every axis of every visible
+                    // channel at once, see the chart canvas below.
+                    Rectangle {
+                        height: 24px;
+                        border-radius: Theme.radius-sm;
+                        background: root.show_all_axes ? #a855f733 : #0f172a;
+                        border-width: 1px;
+                        border-color: root.show_all_axes ? Theme.accent-purple : #334155;
+                        opacity: root.extra_axes_ready ? 1.0 : 0.4;
+
+                        TouchArea {
+                            clicked => {
+                                if root.extra_axes_ready {
+                                    root.show_all_axes = !root.show_all_axes;
+                                }
+                            }
+                        }
+
+                        HorizontalLayout {
+                            padding-left: 8px;
+                            padding-right: 8px;
+                            alignment: center;
+                            Text {
+                                text: "All";
+                                font-size: 10px;
+                                font-weight: 600;
+                                color: root.show_all_axes ? Theme.accent-purple : Theme.text-muted;
+                            }
+                        }
+                    }
+                }
+            }
+
+            // 4. High-Resolution 19-Point Performance Chart Canvas
+            //
+            // Tilt angle is a continuous variable swept 0..90 deg, so this draws each
+            // channel as a line (via `Path`'s SVG `commands`, Slint has no dedicated
+            // polyline element) rather than the 57 discrete bars this used to be --
+            // bars hide exactly the curve shape (where brilliance peaks, where
+            // windowing crosses over) that a reader of this dialog is here for.
+            Rectangle {
+                height: 180px;
+                background: #050811;
+                border-radius: Theme.radius-md;
+                border-width: 1px;
+                border-color: #1e293b;
+                clip: true;
+
+                // Y-Axis Reference Grid Lines, re-derived from `plot`'s own geometry
+                // (rather than hardcoded to match ONE assumed plot size) so they stay
+                // aligned regardless of the card's actual width -- Slint resolves
+                // `plot.y`/`plot.height` from `plot`'s own layout, so this is exact,
+                // not "approximately right" the way the old bar chart's gridlines were.
+                Rectangle { y: plot.y + plot.height * 0.25; width: 100%; height: 1px; background: #1e293b44; }
+                Rectangle { y: plot.y + plot.height * 0.50; width: 100%; height: 1px; background: #1e293b66; }
+                Rectangle { y: plot.y + plot.height * 0.75; width: 100%; height: 1px; background: #1e293b44; }
+
+                Text { x: 6px; y: plot.y - 4px; text: "100%"; font-size: 8px; color: #475569; }
+                Text { x: 6px; y: plot.y + plot.height * 0.25 - 4px; text: "75%"; font-size: 8px; color: #475569; }
+                Text { x: 6px; y: plot.y + plot.height * 0.50 - 4px; text: "50%"; font-size: 8px; color: #475569; }
+                Text { x: 6px; y: plot.y + plot.height * 0.75 - 4px; text: "25%"; font-size: 8px; color: #475569; }
+
+                // Plot area the three line series are scaled into.
+                //
+                // FIX (Problem 1 -- curve narrower than the chart): Slint's `Path`
+                // element defaults `fit` to `contain` -- UNIFORM, aspect-ratio-
+                // preserving, centered scaling of the viewbox into the element's own
+                // box (confirmed against docs.slint.dev's `Path` reference; the old
+                // comment here claiming the fit was already non-uniform was simply
+                // wrong). For a 100x100 viewbox inside this ~900x140 plot, `contain`
+                // scales by min(900/100, 140/100) = 1.4 and centers the result --
+                // a 140px-wide drawing marooned in the middle of a ~900px box, exactly
+                // the "curve occupies only the 30-60 deg region" symptom reported.
+                // Setting `fit: fill` on each `Path` below switches to non-uniform
+                // fill-the-box scaling (x and y scaled independently), which is what
+                // every gridline/label in this file has always assumed. Chosen over
+                // the two Rust-round-trip alternatives (reporting pixel geometry back
+                // via `changed width/height` and matching `viewbox-width/height` to
+                // it, or rebuilding the curve from declarative `MoveTo`/`LineTo`
+                // children) because `fit` already does exactly this, in one property,
+                // with no new Rust<->Slint channel and no change to `curve_path`.
+                plot := Rectangle {
+                    x: 32px;
+                    y: 10px;
+                    width: parent.width - 44px;
+                    height: 140px;
+
+                    // "All axes" overlay: every azimuth's line for a visible channel,
+                    // faded except the selected one. Drawn only when `show_all_axes`
+                    // is on; the single-line case below covers the default view.
+                    // Extinction group first, then Windowing, then Brilliance -- same
+                    // per-channel stacking order as the single-line case, so toggling
+                    // "All" doesn't change which channel reads as "on top".
+                    if root.show_all_axes && root.show_extinction: Path {
+                        width: 100%; height: 100%; fit: fill;
+                        commands: root.graph_extinction_path;
+                        viewbox-width: 100; viewbox-height: 100;
+                        stroke: #ef4444;
+                        stroke-width: root.selected_axis_index == 0 ? 2px : 1.2px;
+                        opacity: root.selected_axis_index == 0 ? 1.0 : 0.28;
+                        fill: transparent;
+                    }
+                    // A plain (unconditional) `for` with a per-instance `visible:`
+                    // rather than `if <cond>: for ... : Path` -- Slint's `if` wraps a
+                    // single element, not a `for`, so the condition has to live on the
+                    // repeated element itself.
+                    for path[idx] in root.graph_extinction_extra_paths : Path {
+                        visible: root.show_all_axes && root.show_extinction;
+                        width: 100%; height: 100%; fit: fill;
+                        commands: path;
+                        viewbox-width: 100; viewbox-height: 100;
+                        stroke: #ef4444;
+                        stroke-width: root.selected_axis_index == idx + 1 ? 2px : 1.2px;
+                        opacity: root.selected_axis_index == idx + 1 ? 1.0 : 0.28;
+                        fill: transparent;
+                    }
+                    if root.show_all_axes && root.show_windowing: Path {
+                        width: 100%; height: 100%; fit: fill;
+                        commands: root.graph_windowing_path;
+                        viewbox-width: 100; viewbox-height: 100;
+                        stroke: Theme.accent-amber;
+                        stroke-width: root.selected_axis_index == 0 ? 2px : 1.2px;
+                        opacity: root.selected_axis_index == 0 ? 1.0 : 0.28;
+                        fill: transparent;
+                    }
+                    for path[idx] in root.graph_windowing_extra_paths : Path {
+                        visible: root.show_all_axes && root.show_windowing;
+                        width: 100%; height: 100%; fit: fill;
+                        commands: path;
+                        viewbox-width: 100; viewbox-height: 100;
+                        stroke: Theme.accent-amber;
+                        stroke-width: root.selected_axis_index == idx + 1 ? 2px : 1.2px;
+                        opacity: root.selected_axis_index == idx + 1 ? 1.0 : 0.28;
+                        fill: transparent;
+                    }
+                    if root.show_all_axes && root.show_brilliance: Path {
+                        width: 100%; height: 100%; fit: fill;
+                        commands: root.graph_brilliance_path;
+                        viewbox-width: 100; viewbox-height: 100;
+                        stroke: Theme.accent-cyan;
+                        stroke-width: root.selected_axis_index == 0 ? 2px : 1.2px;
+                        opacity: root.selected_axis_index == 0 ? 1.0 : 0.28;
+                        fill: transparent;
+                    }
+                    for path[idx] in root.graph_brilliance_extra_paths : Path {
+                        visible: root.show_all_axes && root.show_brilliance;
+                        width: 100%; height: 100%; fit: fill;
+                        commands: path;
+                        viewbox-width: 100; viewbox-height: 100;
+                        stroke: Theme.accent-cyan;
+                        stroke-width: root.selected_axis_index == idx + 1 ? 2px : 1.2px;
+                        opacity: root.selected_axis_index == idx + 1 ? 1.0 : 0.28;
+                        fill: transparent;
+                    }
+
+                    // Single-axis view (default): just the selected axis's line per
+                    // visible channel -- same three `Path` elements this dialog always
+                    // had, now reading `active_*_path` instead of the azimuth-0-only
+                    // `graph_*_path`, and with `fit: fill` fixing Problem 1.
+                    if !root.show_all_axes && root.show_extinction: Path {
+                        width: 100%; height: 100%; fit: fill;
+                        commands: root.active_extinction_path;
+                        viewbox-width: 100; viewbox-height: 100;
+                        stroke: #ef4444;
+                        stroke-width: 2px;
+                        fill: transparent;
+                    }
+                    if !root.show_all_axes && root.show_windowing: Path {
+                        width: 100%; height: 100%; fit: fill;
+                        commands: root.active_windowing_path;
+                        viewbox-width: 100; viewbox-height: 100;
+                        stroke: Theme.accent-amber;
+                        stroke-width: 2px;
+                        fill: transparent;
+                    }
+                    if !root.show_all_axes && root.show_brilliance: Path {
+                        width: 100%; height: 100%; fit: fill;
+                        commands: root.active_brilliance_path;
+                        viewbox-width: 100; viewbox-height: 100;
+                        stroke: Theme.accent-cyan;
+                        stroke-width: 2px;
+                        fill: transparent;
+                    }
+
+                    // Hover tooltip (Problem 2): a transparent `TouchArea` over the
+                    // whole plot reports `mouse-x`, which `snap_tilt_deg` turns into a
+                    // 1%-step tilt angle and `interpolated_value` turns into a reading
+                    // for each visible channel -- see both functions' doc comments,
+                    // and the subtitle caption above, for why these readings are
+                    // explicitly INTERPOLATED rather than additional raytracing.
+                    tooltip_area := TouchArea {
+                        width: 100%;
+                        height: 100%;
+                    }
+
+                    if tooltip_area.has-hover: Rectangle {
+                        x: plot.width * (root.snap_tilt_deg(tooltip_area.mouse-x, plot.width) / 90.0) - 0.5px;
+                        width: 1px;
+                        height: 100%;
+                        background: #94a3b877;
+                    }
+                }
+
+                // Floating tooltip card. Positioned in `plot`'s coordinate space but
+                // drawn as this Rectangle's own child (not `plot`'s) purely so its
+                // z-order sits above the X-axis labels below as well as the lines --
+                // clamped to stay within `plot`'s bounds on both axes (flipping to the
+                // cursor's left once it would overflow the right edge) rather than
+                // relying on this container's `clip: true` to hide an overflow, per
+                // the "must not be clipped" requirement.
+                //
+                // Stacked layout: a tilt-angle heading, then one row per currently-
+                // visible channel (colour swatch + name + value) -- was a single
+                // concatenated line ("Tilt 42.3°  ·  Brilliance 62%  ·  ...") that
+                // clipped against the card's fixed width whenever more than one or two
+                // channels were enabled. `card_h` now grows with
+                // `visible_channel_count` instead of being a fixed 20px, and `card_w`
+                // shrinks accordingly (a stacked row only ever has to fit ONE channel's
+                // label+value, not all of them end to end).
+                if tooltip_area.has-hover: tooltip_card := Rectangle {
+                    property <float> tilt_deg: root.snap_tilt_deg(tooltip_area.mouse-x, plot.width);
+                    property <length> crosshair_x: plot.width * (self.tilt_deg / 90.0);
+                    property <int> visible_channel_count:
+                        (root.show_brilliance ? 1 : 0) + (root.show_windowing ? 1 : 0) + (root.show_extinction ? 1 : 0);
+                    property <length> card_w: 132px;
+                    // Heading row + one 15px row per visible channel, plus the
+                    // VerticalLayout's own padding/spacing below -- generous rather
+                    // than exact, so a font metrics difference can never clip a row.
+                    property <length> card_h: 24px + (self.visible_channel_count * 15px);
+                    property <bool> flip: self.crosshair_x > (plot.width - self.card_w - 12px);
+                    x: plot.x + Math.max(0px, Math.min(plot.width - self.card_w,
+                        self.flip ? (self.crosshair_x - self.card_w - 10px) : (self.crosshair_x + 10px)));
+                    // Unchanged formula from before `card_h` became dynamic -- it was
+                    // already written in terms of `self.card_h`/`plot.height`, never a
+                    // hardcoded number, so re-verifying it against a taller card is
+                    // just confirming the same `Math.max(0px, ...)` (top edge) /
+                    // `Math.min(plot.height - self.card_h, ...)` (bottom edge) clamp
+                    // still holds for any `card_h < plot.height`: it does, for every
+                    // channel-count from 0 to 3 (card_h maxes out at 24px + 45px =
+                    // 69px, well under `plot`'s fixed 140px height).
+                    y: plot.y + Math.max(0px, Math.min(plot.height - self.card_h, tooltip_area.mouse-y - self.card_h - 8px));
+                    width: self.card_w;
+                    height: self.card_h;
+                    background: #0f1523ee;
+                    border-radius: Theme.radius-sm;
+                    border-width: 1px;
+                    border-color: #334155;
+
+                    VerticalLayout {
+                        padding: 5px;
+                        spacing: 2px;
+
+                        Text {
+                            text: "Tilt " + (Math.round(tooltip_card.tilt_deg * 10.0) / 10.0) + "°";
+                            font-size: 9px;
+                            font-weight: 700;
+                            color: Theme.text-primary;
+                        }
+                        // Same colours the channel toggle pills above use, so a reader
+                        // can match a tooltip row to its toggle/curve at a glance.
+                        if root.show_brilliance: HorizontalLayout {
+                            spacing: 5px;
+                            Rectangle { width: 7px; height: 7px; border-radius: 3px; background: Theme.accent-cyan; }
+                            Text {
+                                text: "Brilliance " + Math.round(root.interpolated_value(root.active_brilliance_values, tooltip_card.tilt_deg)) + "%";
+                                font-size: 9px;
+                                font-weight: 600;
+                                color: Theme.text-primary;
+                            }
+                        }
+                        if root.show_windowing: HorizontalLayout {
+                            spacing: 5px;
+                            Rectangle { width: 7px; height: 7px; border-radius: 3px; background: Theme.accent-amber; }
+                            Text {
+                                text: "Windowing " + Math.round(root.interpolated_value(root.active_windowing_values, tooltip_card.tilt_deg)) + "%";
+                                font-size: 9px;
+                                font-weight: 600;
+                                color: Theme.text-primary;
+                            }
+                        }
+                        if root.show_extinction: HorizontalLayout {
+                            spacing: 5px;
+                            Rectangle { width: 7px; height: 7px; border-radius: 3px; background: #ef4444; }
+                            Text {
+                                text: "Extinction " + Math.round(root.interpolated_value(root.active_extinction_values, tooltip_card.tilt_deg)) + "%";
+                                font-size: 9px;
+                                font-weight: 600;
+                                color: Theme.text-primary;
+                            }
+                        }
+                    }
+                }
+
+                // X-Axis Angle Labels (0° to 90° in 5° steps), aligned under `plot` via
+                // its own geometry rather than the hardcoded offsets `plot` itself used
+                // to duplicate.
+                HorizontalLayout {
+                    x: plot.x;
+                    y: 154px;
+                    width: plot.width;
+                    spacing: 2px;
+
+                    for val[idx] in root.graph_angles : Text {
+                        horizontal-stretch: 1;
+                        text: (Math.mod(idx, 2) == 0 || idx == 18) ? root.graph_angles[idx] + "°" : "·";
+                        font-size: 8.5px;
+                        color: Math.abs(root.cam_pitch_deg - root.graph_angles_num[idx]) < 2.6 ? Theme.accent-cyan : #64748b;
+                        font-weight: Math.abs(root.cam_pitch_deg - root.graph_angles_num[idx]) < 2.6 ? 700 : 400;
+                        horizontal-alignment: center;
+                    }
+                }
+            }
+
+            // 5. Footer Bar Actions
+            HorizontalLayout {
+                alignment: space-between;
+                spacing: 10px;
+
+                Rectangle {
+                    height: 32px;
+                    border-radius: Theme.radius-sm;
+                    background: copy_btn.has-hover ? #1e293b : #0f172a;
+                    border-width: 1px;
+                    border-color: #334155;
+
+                    copy_btn := TouchArea {
+                        clicked => { root.copy_curve_data(); }
+                    }
+
+                    HorizontalLayout {
+                        padding-left: 12px;
+                        padding-right: 12px;
+                        spacing: 6px;
+                        alignment: center;
+                        Image { source: @image-url("../icons/clipboard.svg"); colorize: Theme.text-primary; width: 12px; height: 12px; vertical-alignment: center; }
+                        Text { text: "Copy 19-Point Data Table (All 4 Axes)"; font-size: 11px; font-weight: 600; color: Theme.text-primary; vertical-alignment: center; }
+                    }
+                }
+
+                Rectangle {
+                    width: 90px;
+                    height: 32px;
+                    border-radius: Theme.radius-sm;
+                    background: done_btn.has-hover ? #7dd3fc : Theme.accent-cyan;
+
+                    done_btn := TouchArea {
+                        clicked => { root.close(); }
+                    }
+
+                    Text { text: "Close"; font-size: 12px; font-weight: 700; color: #0f172a; horizontal-alignment: center; vertical-alignment: center; }
+                }
+            }
+        }
+    }
+}

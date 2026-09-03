@@ -1,0 +1,1424 @@
+import { Slider, Button, LineEdit, ScrollView } from "std-widgets.slint";
+import { Theme } from "../theme.slint";
+import { LightingPresetItem } from "../types.slint";
+
+export component SettingsDialog inherits Rectangle {
+    in property <bool> is_open: false;
+    // This popup is positioned by absolute x/y/z in `gem_viewport.slint` rather than
+    // laid out in a container, so it has no framework-given way to learn how tall its
+    // surroundings actually are -- `GemViewportView` passes its own height through
+    // explicitly (same value the modal backdrop's `height: 100%` resolves to) so the
+    // cap below can be a fraction of it instead of a fixed pixel number. See the
+    // `height`/`height_cap` doc comment further down for how it's used.
+    in property <length> available_height: 600px;
+    // "Target Samples" slider -- carries the EXPONENT (3..=10), not the
+    // sample count. See `sample_exponent`/`target_samples_count` below for the
+    // derived display values, and this component's `target_samples_changed`
+    // callback's doc comment for why the exponent (not the count) is what's fired.
+    in-out property <float> target_samples_exponent: 8.0; // 256 samples
+    in-out property <int> selected_bounce_index: 2;  // 0: 4, 1: 8, 2: 12, 3: 24, 4: 64, 5: 128
+    in-out property <float> exposure_val: 1.0;
+    in-out property <float> light_yaw_deg: 48.0;   // 0 to 360 deg
+    in-out property <float> light_pitch_deg: 54.0; // 10 to 90 deg
+    // Inclusion/subsurface scattering amount, 0.0 (off) to 3.0 (milky/heavily
+    // included) -- range and both endpoint meanings come from
+    // `GemMaterial::scattering_sigma_s`'s own doc comment
+    // (crates/gemray/src/optics/materials.rs).
+    in-out property <float> inclusion_sigma_s: 0.0;
+    // Crystal-axis orientation override -- off ("As Cut") by default, leaving
+    // the resolved material's own c_axis untouched. `c_axis_tilt_deg` (0-90, tilt from
+    // the table normal) and `c_axis_azimuth_deg` (0-360, rotation around it) only take
+    // effect while `c_axis_override_enabled` is on. `c_axis_override_available` is
+    // driven from Rust (`gui::mod::is_c_axis_override_available`), `false` for an
+    // isotropic material -- see the section below for how that greys the control out.
+    in-out property <bool> c_axis_override_enabled: false;
+    in-out property <float> c_axis_tilt_deg: 0.0;
+    in-out property <float> c_axis_azimuth_deg: 0.0;
+    in property <bool> c_axis_override_available: true;
+    // Bruted (frosted) girdle finish toggle -- off by default (every facet
+    // polished, today's behaviour). A plain on/off switch, not a slider.
+    in-out property <bool> girdle_frosted: false;
+    // Facet edge (meet-point) rounding radius, 0.0 (off, perfectly sharp) to
+    // 0.03 -- see `AppSettings::edge_rounding_radius`'s own doc comment
+    // (apps/diagram-gui/src/settings/model.rs) for why 0.03 is the slider's ceiling.
+    in-out property <float> edge_rounding_radius: 0.0;
+    // Physical stone size: girdle width in millimetres, 0.0 (off, today's
+    // unscaled look) to 20.0 -- see `RenderContext::stone_width_mm`'s own doc comment
+    // (apps/diagram-gui/src/bridge/render_thread/context.rs) for the mechanism. 20mm
+    // comfortably covers melee through a large statement stone; the slider ceiling is
+    // just this control's convenient drag range, not a hard limit enforced anywhere
+    // downstream.
+    in-out property <float> stone_width_mm: 0.0;
+    // Live render resolution: a FIXED list of pill choices (640x480 / 800x600 / 1280x720
+    // / 1920x1080), not a continuous control -- there's no natural drag-and-round scale
+    // between four arbitrary resolutions the way there is for the power-of-two samples
+    // slider above. Index 1 (800x600) is the default, matching
+    // `RenderContext::default()`/`settings::model::DEFAULT_RENDER_WIDTH`. See
+    // `resolution_changed`'s doc comment below for why this stays a fixed list instead
+    // of tracking the viewport widget's actual on-screen size.
+    in-out property <int> resolution_index: 1;
+    // Local preview-then-settle rendering: while the camera is moving, trace
+    // at a fraction of "Render Resolution" above, then snap back to full resolution
+    // once it settles (the same feel the remote preview-then-handoff already gives
+    // when a worker is configured, but achievable locally with no worker at all). A
+    // discrete pill choice (0: Off/default, 1: Half, 2: Quarter), not a slider -- see
+    // `local_preview_scale_changed`'s doc comment below for why.
+    in-out property <int> local_preview_scale_index: 0;
+    // Live rendering's Local/Remote/Local+Remote choice -- once the camera settles,
+    // which engine(s) contribute to the viewport image. Same segmented-pill idiom as
+    // `export_dialog.slint`'s own "Compute" section (0: Local only, 1: Remote only,
+    // 2: Local + Remote), and the same disabled-pill-with-reason treatment for the
+    // Remote/Local+Remote pills whenever `live_remote_available` is false -- see
+    // `live_remote_available`'s own doc comment. `2` (Local + Remote) matches
+    // `settings::model::worker::LiveComputeTarget`'s own `Default`, which is a no-op
+    // until a worker is actually configured (see that type's doc comment), so the
+    // pill's initial state here is truthful even before any worker exists.
+    in-out property <int> live_compute_target_index: 2;
+    // Whether at least one remote worker is configured for the live rendering path --
+    // gates the Remote/Local+Remote pills below exactly like `export_remote_available`
+    // gates `export_dialog.slint`'s own Compute pills, WITH the same "disabled, not
+    // hidden, always shown WITH a reason" requirement. Deliberately a simpler bar than
+    // the export dialog's `check_remote_availability` (which performs a real TLS
+    // handshake probe): the live path already re-attempts a real connection on every
+    // settle and gracefully falls back on failure (`bridge::handoff`'s existing
+    // `RemoteFailed` path), so this only needs to answer "is there a worker to try at
+    // all", not "is it reachable right now" -- a stale answer here just means one wasted
+    // settle attempt, already a case the live path handles.
+    in property <bool> live_remote_available: false;
+    // Human-readable reason `live_remote_available` is false. Left at its default ("")
+    // for now -- `live_remote_available` only ever has one possible reason ("no worker
+    // configured", unlike the export dialog's own probe-backed
+    // `export_remote_unavailable_reason`, which also distinguishes unreachable/
+    // library-only), so nothing currently binds this from above; the fallback text
+    // below covers that one reason. Kept as its own property (rather than hardcoding
+    // the string directly in the `Text` below) so a future caller that DOES want to
+    // report a more specific reason can bind one in without touching this file again.
+    in property <string> live_remote_unavailable_reason: "";
+    // HDR environment maps: the typed path field's live text -- `gui::mod`'s
+    // `apply_loaded_settings` seeds this from the last-loaded path at startup.
+    // `env_map_status` (Rust-driven, "Loaded: <file> (WxH)") and `env_map_loaded`
+    // (whether Clear/the CPU-only note show) are driven by the load/clear callbacks
+    // below, never set from this side.
+    in-out property <string> env_map_path: "";
+    in property <string> env_map_status: "";
+    in property <bool> env_map_loaded: false;
+    // Rounded exponent driving the displayed sample count -- same continuous-drag-
+    // then-round idiom as `export_dialog.slint`'s own sample-count slider
+    // (`sample_exponent_raw`/`sample_exponent`): `SliderBase` only snaps to `step` on
+    // arrow-key nudges, not on pointer drag (see slint's
+    // widgets/common/slider-base.slint), so the rounding has to happen here instead.
+    property <int> sample_exponent: Math.round(root.target_samples_exponent);
+    property <int> target_samples_count: Math.round(Math.pow(2.0, root.sample_exponent));
+    in property <[float]> graph_brilliance: [20.0, 25.0, 32.0, 42.0, 50.0, 58.0, 65.0, 72.0, 78.0, 82.0, 84.0, 85.0, 84.0, 82.0, 80.0, 76.0, 70.0, 62.0, 50.0];
+    in property <[float]> graph_extinction: [65.0, 58.0, 50.0, 40.0, 32.0, 25.0, 18.0, 14.0, 10.0, 8.0, 6.0, 5.0, 6.0, 7.0, 9.0, 12.0, 18.0, 26.0, 38.0];
+    in property <[float]> graph_windowing: [40.0, 35.0, 28.0, 20.0, 15.0, 10.0, 8.0, 6.0, 5.0, 4.0, 4.0, 5.0, 6.0, 8.0, 10.0, 14.0, 18.0, 24.0, 30.0];
+    in property <[string]> graph_angles: ["0", "5", "10", "15", "20", "25", "30", "35", "40", "45", "50", "55", "60", "65", "70", "75", "80", "85", "90"];
+    in property <[float]> graph_angles_num: [0.0, 5.0, 10.0, 15.0, 20.0, 25.0, 30.0, 35.0, 40.0, 45.0, 50.0, 55.0, 60.0, 65.0, 70.0, 75.0, 80.0, 85.0, 90.0];
+
+    // Named lighting presets
+    in property <[LightingPresetItem]> lighting_presets: [];
+    property <bool> adding_preset: false;
+    property <string> new_preset_name: "";
+    // Index (into `lighting_presets`) currently being renamed inline, or -1 if none.
+    property <int> renaming_index: -1;
+    property <string> rename_text: "";
+
+    callback close();
+    // Carries the "Target Samples" slider's EXPONENT (`sample_exponent`
+    // above), not the resolved sample count -- `gui::sample_scale` (Rust) is where
+    // that gets turned into the actual count that's stored/rendered.
+    callback target_samples_changed(int);
+    // Carries the resolved (width, height) pair directly, same treatment as
+    // `bounces_changed` below -- there's no derived-vs-raw distinction to make (unlike
+    // `target_samples_changed`'s exponent) since each pill's dimensions ARE what gets
+    // stored/rendered. Slint never reports the viewport `Image`'s actual on-screen size
+    // back to Rust, so `RenderContext::width`/`.height` (and this setting) offer a fixed
+    // list to pick from instead of tracking the real widget size -- see
+    // `RenderContext::width`'s own doc comment for the full reasoning. Deliberately a
+    // scoping decision, not an oversight: wiring the real viewport size through would be
+    // a much larger change than this control.
+    callback resolution_changed(int, int);
+    // Local preview-then-settle rendering: carries the pill's clicked index
+    // directly (same int-discriminant treatment `bounces_changed` below already gives
+    // its own pill selector), not a resolved scale value: `gui::mod::local_preview_scale_from_index`
+    // (Rust) is the one boundary crossing from "pill position" to the actual
+    // `LocalPreviewScale` that's stored/rendered.
+    callback local_preview_scale_changed(int);
+    // Live rendering's Local/Remote/Local+Remote choice: carries the clicked pill's
+    // index directly, same int-discriminant treatment `local_preview_scale_changed`
+    // above already gives its own pill selector -- `gui::remote::live_compute_target_from_index`
+    // (Rust) is the one boundary crossing from "pill position" to the actual
+    // `LiveComputeTarget` that's stored/rendered.
+    callback live_compute_target_changed(int);
+    // HDR environment maps: carries the path field's current text -- same
+    // typed-path convention `import_dialog.slint`'s `import_path(string)` callback
+    // already uses for `.asc` files. The field itself stays typed/pasteable; "Browse..."
+    // (`pick_hdr_file`, handled in Rust with `rfd::FileDialog`) fills it via a native
+    // file-open dialog filtered to `.hdr` -- the only format `EnvironmentMap::from_hdr_file`
+    // actually decodes (see `gui::camera_lighting::setup_environment_map_callbacks`).
+    callback load_env_map(string);
+    // Takes the field's current text (to seed the dialog's starting directory) and
+    // returns the chosen file, or the SAME text back unchanged if the user cancelled --
+    // so `env_map_path = root.pick_hdr_file(env_map_path)` below is a safe no-op on
+    // cancel without needing a local variable to avoid opening the dialog twice.
+    callback pick_hdr_file(string) -> string;
+    callback clear_env_map();
+    callback bounces_changed(int);
+    callback exposure_changed(float);
+    // Inclusion/subsurface scattering amount -- carries the raw value
+    // directly (linear, unlike the samples slider above).
+    callback inclusion_changed(float);
+    // Crystal-axis orientation override. `c_axis_angles_changed` carries BOTH
+    // angles (the moved slider's new value plus the other slider's own current value)
+    // -- same two-values-per-callback treatment `light_pos_changed` below already
+    // gives light yaw/pitch.
+    callback c_axis_override_changed(bool);
+    callback c_axis_angles_changed(float, float);
+    // Bruted (frosted) girdle finish -- a plain on/off switch, not a slider.
+    callback girdle_frosted_changed(bool);
+    // Facet edge rounding radius -- carries the raw value directly, same
+    // treatment as `inclusion_changed` above.
+    callback edge_rounding_changed(float);
+    // Physical stone size (girdle width, mm) -- carries the raw value directly,
+    // same treatment as `edge_rounding_changed` above.
+    callback stone_width_changed(float);
+    callback light_pos_changed(float, float);
+    callback reset_defaults();
+    callback open_performance_graph();
+    // name -> Rust captures the CURRENT live lighting-rig state (light yaw/pitch,
+    // exposure, rig selection, camera distance) and saves it under this name.
+    callback save_lighting_preset(string);
+    callback apply_lighting_preset(int);
+    callback rename_lighting_preset(int, string);
+    callback delete_lighting_preset(int);
+
+    width: 380px;
+    // Content-driven height, capped: `content.preferred-height` is still what decides
+    // the height on a short dialog (see `filter_panel.slint`'s doc comment for why
+    // `Rectangle` needs this at all -- unset, it'd expand to fill `GemViewportView`,
+    // the full-viewport area it's anchored inside). But with sliders accumulating,
+    // content can now be taller than the window, and there'd be no way to reach the
+    // bottom of it. `height_cap` bounds it to a fraction of the backdrop's actual
+    // height (`available_height`, passed in from `GemViewportView`) instead of a fixed
+    // pixel number, so it adapts to the window; `ScrollView` below makes the part past
+    // the cap reachable.
+    //
+    // THE TRAP: `ScrollView` itself expands to fill whatever height it's given --
+    // exactly the stretch-to-bottom failure `content.preferred-height` above exists to
+    // prevent. Naively wrapping `content` in a `ScrollView` and leaving this binding
+    // as `content.preferred-height` would reintroduce it, because a `ScrollView` isn't
+    // subject to the "no explicit width/height" rule the way a bare `Rectangle` is --
+    // it always sizes to its constraint. Resolving to `min(content.preferred-height,
+    // height_cap)` here keeps both cases working: short content is unaffected (the
+    // `ScrollView` just resolves to a height equal to its child, nothing to scroll),
+    // and tall content is clamped with the overflow scrollable.
+    property <length> height_cap: root.available_height * 0.85;
+    height: content.preferred-height < root.height_cap ? content.preferred-height : root.height_cap;
+    background: #111827ee;
+    border-radius: Theme.radius-md;
+    border-width: 1px;
+    border-color: #334155;
+    drop-shadow-blur: 24px;
+    drop-shadow-color: #000000ee;
+    drop-shadow-offset-y: 6px;
+
+    // `width`/`height: 100%` here are deliberate, not the implicit-fill default this
+    // file's own doc comments warn about: `root.height` above is already the resolved
+    // min(content, cap), so 100% just matches the `ScrollView` to that -- it hugs on
+    // short content and clips-and-scrolls on tall content, either way driven by
+    // `content.preferred-height` computed below, not by this `ScrollView`'s own size.
+    ScrollView {
+        width: 100%;
+        height: 100%;
+
+    content := VerticalLayout {
+        padding: 16px;
+        spacing: 14px;
+
+        // Header with Title and Close '×' button
+        HorizontalLayout {
+            alignment: space-between;
+
+            HorizontalLayout {
+                spacing: 8px;
+                Image { source: @image-url("../icons/gear.svg"); colorize: Theme.accent-cyan; width: 15px; height: 15px; vertical-alignment: center; }
+                Text { text: "Rendering Settings"; font-size: 13px; font-weight: 700; color: Theme.text-primary; vertical-alignment: center; }
+            }
+
+            Rectangle {
+                width: 24px;
+                height: 24px;
+                border-radius: 12px;
+                background: close_btn.has-hover ? #1e293b : transparent;
+
+                close_btn := TouchArea {
+                    clicked => { root.close(); }
+                }
+
+                Image { source: @image-url("../icons/close.svg"); colorize: Theme.text-secondary; width: 12px; height: 12px; horizontal-alignment: center; vertical-alignment: center; }
+            }
+        }
+
+        // Target Samples: replaces the old four-tier quality-preset pills.
+        // Moves in powers of two -- image noise falls as 1/sqrt(N), so a linear
+        // 8..1024 count control would spend ~97% of its travel above 32 spp where
+        // each step barely changes anything visible. The slider drags the EXPONENT
+        // (3..=10); `sample_exponent`/`target_samples_count` above derive the rounded
+        // exponent and the displayed count from it. Same continuous-drag-then-round
+        // idiom as `export_dialog.slint`'s own sample-count slider.
+        VerticalLayout {
+            spacing: 4px;
+            HorizontalLayout {
+                alignment: space-between;
+                Text { text: "Target Samples"; font-size: 11px; font-weight: 600; color: Theme.text-muted; }
+                Text { text: root.target_samples_count; font-size: 11px; font-weight: 700; color: Theme.accent-cyan; }
+            }
+            Slider {
+                minimum: 3;
+                maximum: 10;
+                step: 1;
+                value <=> root.target_samples_exponent;
+                // `value` is two-way bound to `target_samples_exponent`, which
+                // `SliderBase.set-value` updates BEFORE firing `changed` -- so
+                // `root.sample_exponent` (already `int`-typed, unlike `val` itself)
+                // reflects this exact change by the time it's read here.
+                changed(val) => { root.target_samples_changed(root.sample_exponent); }
+            }
+        }
+
+        // Render Resolution - Segmented Pill Selector, same idiom as the Ray Bounces
+        // picker below and `export_dialog.slint`'s own "Output Size" pills (that
+        // component's doc comment calls this exact style out as shared with
+        // `SettingsDialog`'s quality/bounce pickers). A fixed list rather than a slider
+        // -- see `resolution_index`/`resolution_changed`'s doc comments above for why.
+        VerticalLayout {
+            spacing: 6px;
+            Text { text: "Render Resolution"; font-size: 11px; font-weight: 600; color: Theme.text-muted; }
+
+            HorizontalLayout {
+                spacing: 4px;
+
+                // 640x480
+                Rectangle {
+                    horizontal-stretch: 1;
+                    height: 28px;
+                    border-radius: Theme.radius-sm;
+                    background: root.resolution_index == 0 ? Theme.accent-cyan : (res0_touch.has-hover ? #1e293b : #0f172a);
+                    border-width: 1px;
+                    border-color: root.resolution_index == 0 ? Theme.accent-cyan : #334155;
+
+                    res0_touch := TouchArea {
+                        clicked => {
+                            root.resolution_index = 0;
+                            root.resolution_changed(640, 480);
+                        }
+                    }
+
+                    Text {
+                        text: "640×480";
+                        font-size: 11px;
+                        font-weight: 600;
+                        color: root.resolution_index == 0 ? #0f172a : Theme.text-secondary;
+                        horizontal-alignment: center;
+                        vertical-alignment: center;
+                    }
+                }
+
+                // 800x600 (default)
+                Rectangle {
+                    horizontal-stretch: 1;
+                    height: 28px;
+                    border-radius: Theme.radius-sm;
+                    background: root.resolution_index == 1 ? Theme.accent-cyan : (res1_touch.has-hover ? #1e293b : #0f172a);
+                    border-width: 1px;
+                    border-color: root.resolution_index == 1 ? Theme.accent-cyan : #334155;
+
+                    res1_touch := TouchArea {
+                        clicked => {
+                            root.resolution_index = 1;
+                            root.resolution_changed(800, 600);
+                        }
+                    }
+
+                    Text {
+                        text: "800×600";
+                        font-size: 11px;
+                        font-weight: 600;
+                        color: root.resolution_index == 1 ? #0f172a : Theme.text-secondary;
+                        horizontal-alignment: center;
+                        vertical-alignment: center;
+                    }
+                }
+
+                // 1280x720
+                Rectangle {
+                    horizontal-stretch: 1;
+                    height: 28px;
+                    border-radius: Theme.radius-sm;
+                    background: root.resolution_index == 2 ? Theme.accent-cyan : (res2_touch.has-hover ? #1e293b : #0f172a);
+                    border-width: 1px;
+                    border-color: root.resolution_index == 2 ? Theme.accent-cyan : #334155;
+
+                    res2_touch := TouchArea {
+                        clicked => {
+                            root.resolution_index = 2;
+                            root.resolution_changed(1280, 720);
+                        }
+                    }
+
+                    Text {
+                        text: "1280×720";
+                        font-size: 11px;
+                        font-weight: 600;
+                        color: root.resolution_index == 2 ? #0f172a : Theme.text-secondary;
+                        horizontal-alignment: center;
+                        vertical-alignment: center;
+                    }
+                }
+
+                // 1920x1080
+                Rectangle {
+                    horizontal-stretch: 1;
+                    height: 28px;
+                    border-radius: Theme.radius-sm;
+                    background: root.resolution_index == 3 ? Theme.accent-cyan : (res3_touch.has-hover ? #1e293b : #0f172a);
+                    border-width: 1px;
+                    border-color: root.resolution_index == 3 ? Theme.accent-cyan : #334155;
+
+                    res3_touch := TouchArea {
+                        clicked => {
+                            root.resolution_index = 3;
+                            root.resolution_changed(1920, 1080);
+                        }
+                    }
+
+                    Text {
+                        text: "1920×1080";
+                        font-size: 11px;
+                        font-weight: 600;
+                        color: root.resolution_index == 3 ? #0f172a : Theme.text-secondary;
+                        horizontal-alignment: center;
+                        vertical-alignment: center;
+                    }
+                }
+            }
+
+            // Plain factual cost note, not an estimator (Task explicitly asks for a
+            // note, not a time predictor -- render time depends on scene/hardware in
+            // ways this dialog has no way to know).
+            Text {
+                text: "Higher resolutions render more pixels per sample and take proportionally longer to converge.";
+                font-size: 9px;
+                color: Theme.text-muted;
+                wrap: word-wrap;
+            }
+        }
+
+        // Motion Preview Resolution (Task: local preview-then-settle rendering) --
+        // optional, off by default. Same segmented-pill idiom as Render Resolution
+        // above; a discrete choice rather than a slider since there's no meaningful
+        // continuum between "half" and "0.47".
+        VerticalLayout {
+            spacing: 6px;
+            Text { text: "Motion Preview Resolution"; font-size: 11px; font-weight: 600; color: Theme.text-muted; }
+
+            HorizontalLayout {
+                spacing: 4px;
+
+                // Off (default) -- always renders at full "Render Resolution" above,
+                // exactly as before this control existed.
+                Rectangle {
+                    horizontal-stretch: 1;
+                    height: 28px;
+                    border-radius: Theme.radius-sm;
+                    background: root.local_preview_scale_index == 0 ? Theme.accent-cyan : (mp0_touch.has-hover ? #1e293b : #0f172a);
+                    border-width: 1px;
+                    border-color: root.local_preview_scale_index == 0 ? Theme.accent-cyan : #334155;
+
+                    mp0_touch := TouchArea {
+                        clicked => {
+                            root.local_preview_scale_index = 0;
+                            root.local_preview_scale_changed(0);
+                        }
+                    }
+
+                    Text {
+                        text: "Off";
+                        font-size: 11px;
+                        font-weight: 600;
+                        color: root.local_preview_scale_index == 0 ? #0f172a : Theme.text-secondary;
+                        horizontal-alignment: center;
+                        vertical-alignment: center;
+                    }
+                }
+
+                // Half resolution while the camera is moving.
+                Rectangle {
+                    horizontal-stretch: 1;
+                    height: 28px;
+                    border-radius: Theme.radius-sm;
+                    background: root.local_preview_scale_index == 1 ? Theme.accent-cyan : (mp1_touch.has-hover ? #1e293b : #0f172a);
+                    border-width: 1px;
+                    border-color: root.local_preview_scale_index == 1 ? Theme.accent-cyan : #334155;
+
+                    mp1_touch := TouchArea {
+                        clicked => {
+                            root.local_preview_scale_index = 1;
+                            root.local_preview_scale_changed(1);
+                        }
+                    }
+
+                    Text {
+                        text: "Half";
+                        font-size: 11px;
+                        font-weight: 600;
+                        color: root.local_preview_scale_index == 1 ? #0f172a : Theme.text-secondary;
+                        horizontal-alignment: center;
+                        vertical-alignment: center;
+                    }
+                }
+
+                // Quarter resolution while the camera is moving.
+                Rectangle {
+                    horizontal-stretch: 1;
+                    height: 28px;
+                    border-radius: Theme.radius-sm;
+                    background: root.local_preview_scale_index == 2 ? Theme.accent-cyan : (mp2_touch.has-hover ? #1e293b : #0f172a);
+                    border-width: 1px;
+                    border-color: root.local_preview_scale_index == 2 ? Theme.accent-cyan : #334155;
+
+                    mp2_touch := TouchArea {
+                        clicked => {
+                            root.local_preview_scale_index = 2;
+                            root.local_preview_scale_changed(2);
+                        }
+                    }
+
+                    Text {
+                        text: "Quarter";
+                        font-size: 11px;
+                        font-weight: 600;
+                        color: root.local_preview_scale_index == 2 ? #0f172a : Theme.text-secondary;
+                        horizontal-alignment: center;
+                        vertical-alignment: center;
+                    }
+                }
+            }
+
+            Text {
+                text: "While dragging the gem, render at a reduced resolution for a smoother feel, then snap back to full resolution once you stop moving.";
+                font-size: 9px;
+                color: Theme.text-muted;
+                wrap: word-wrap;
+            }
+        }
+
+        // Live Compute: which engine(s) trace the settled viewport image. Same
+        // segmented-pill idiom, and the same disabled-with-a-reason treatment for the
+        // Remote/Local+Remote pills, as `export_dialog.slint`'s own "Compute" section --
+        // see `live_compute_target_index`/`live_remote_available`'s own doc comments.
+        VerticalLayout {
+            spacing: 6px;
+            Text { text: "Live Compute"; font-size: 11px; font-weight: 600; color: Theme.text-muted; }
+
+            HorizontalLayout {
+                spacing: 4px;
+
+                Rectangle {
+                    horizontal-stretch: 1;
+                    height: 28px;
+                    border-radius: Theme.radius-sm;
+                    background: root.live_compute_target_index == 0 ? Theme.accent-cyan : (lct0_touch.has-hover ? #1e293b : #0f172a);
+                    border-width: 1px;
+                    border-color: root.live_compute_target_index == 0 ? Theme.accent-cyan : #334155;
+
+                    lct0_touch := TouchArea {
+                        clicked => {
+                            root.live_compute_target_index = 0;
+                            root.live_compute_target_changed(0);
+                        }
+                    }
+
+                    Text { text: "Local only"; font-size: 11px; font-weight: 600; color: root.live_compute_target_index == 0 ? #0f172a : Theme.text-secondary; horizontal-alignment: center; vertical-alignment: center; }
+                }
+
+                Rectangle {
+                    horizontal-stretch: 1;
+                    height: 28px;
+                    border-radius: Theme.radius-sm;
+                    opacity: root.live_remote_available ? 1.0 : 0.45;
+                    background: root.live_compute_target_index == 1 ? Theme.accent-cyan : (lct1_touch.has-hover ? #1e293b : #0f172a);
+                    border-width: 1px;
+                    border-color: root.live_compute_target_index == 1 ? Theme.accent-cyan : #334155;
+
+                    lct1_touch := TouchArea {
+                        enabled: root.live_remote_available;
+                        clicked => {
+                            root.live_compute_target_index = 1;
+                            root.live_compute_target_changed(1);
+                        }
+                    }
+
+                    Text { text: "Remote only"; font-size: 11px; font-weight: 600; color: root.live_compute_target_index == 1 ? #0f172a : Theme.text-secondary; horizontal-alignment: center; vertical-alignment: center; }
+                }
+
+                Rectangle {
+                    horizontal-stretch: 1;
+                    height: 28px;
+                    border-radius: Theme.radius-sm;
+                    opacity: root.live_remote_available ? 1.0 : 0.45;
+                    background: root.live_compute_target_index == 2 ? Theme.accent-cyan : (lct2_touch.has-hover ? #1e293b : #0f172a);
+                    border-width: 1px;
+                    border-color: root.live_compute_target_index == 2 ? Theme.accent-cyan : #334155;
+
+                    lct2_touch := TouchArea {
+                        enabled: root.live_remote_available;
+                        clicked => {
+                            root.live_compute_target_index = 2;
+                            root.live_compute_target_changed(2);
+                        }
+                    }
+
+                    Text { text: "Local + Remote"; font-size: 11px; font-weight: 600; color: root.live_compute_target_index == 2 ? #0f172a : Theme.text-secondary; horizontal-alignment: center; vertical-alignment: center; }
+                }
+            }
+
+            if !root.live_remote_available: Text {
+                text: root.live_remote_unavailable_reason == "" ? "No remote worker is configured." : root.live_remote_unavailable_reason;
+                font-size: 9px;
+                color: Theme.text-muted;
+                wrap: word-wrap;
+            }
+
+            if root.live_remote_available: Text {
+                text: "Once the camera settles, Local + Remote lets both engines keep tracing the same image together for a faster converge; Remote only hands the whole image to the worker.";
+                font-size: 9px;
+                color: Theme.text-muted;
+                wrap: word-wrap;
+            }
+        }
+
+        // Ray Bounces - Segmented Pill Selector (No popups!)
+        //
+        // Ladder is 4/8/12/24/64/128, backed by `crates/gemray/examples/bounce_cost.rs`
+        // measurements rather than guesswork: cost is nearly flat in the cap (an 85x
+        // spread from 12 to 1024 costs under 1.4x wall-clock, CPU) because the path
+        // population is short-tailed (median 4 bounces, p95 29, only 0.03% of paths
+        // ever reach 128). 12 stays the default -- it's the sane interactive middle.
+        // 24 keeps the old ceiling alive as a mid rung so a settings file saved before
+        // this ladder changed still maps to a real pill (see `gui::mod::bounces_index`).
+        // 64 and 128 are the measured points where the hardest case (Diamond) crosses
+        // 99.5% and 99.99% converged against a 1024-bounce reference (MAD 0.3 and 0.01
+        // sRGB levels respectively); nothing above 128 is offered because the
+        // measurement shows zero further image change up to 1024.
+        VerticalLayout {
+            spacing: 6px;
+            Text { text: "Max Ray Bounces (Dispersion Depth)"; font-size: 11px; font-weight: 600; color: Theme.text-muted; }
+
+            HorizontalLayout {
+                spacing: 4px;
+
+                // 4 Bounces
+                Rectangle {
+                    horizontal-stretch: 1;
+                    height: 28px;
+                    border-radius: Theme.radius-sm;
+                    background: root.selected_bounce_index == 0 ? Theme.accent-cyan : (b0_touch.has-hover ? #1e293b : #0f172a);
+                    border-width: 1px;
+                    border-color: root.selected_bounce_index == 0 ? Theme.accent-cyan : #334155;
+
+                    b0_touch := TouchArea {
+                        clicked => {
+                            root.selected_bounce_index = 0;
+                            root.bounces_changed(4);
+                        }
+                    }
+
+                    Text {
+                        text: "4";
+                        font-size: 11px;
+                        font-weight: 600;
+                        color: root.selected_bounce_index == 0 ? #0f172a : Theme.text-secondary;
+                        horizontal-alignment: center;
+                        vertical-alignment: center;
+                    }
+                }
+
+                // 8 Bounces
+                Rectangle {
+                    horizontal-stretch: 1;
+                    height: 28px;
+                    border-radius: Theme.radius-sm;
+                    background: root.selected_bounce_index == 1 ? Theme.accent-cyan : (b1_touch.has-hover ? #1e293b : #0f172a);
+                    border-width: 1px;
+                    border-color: root.selected_bounce_index == 1 ? Theme.accent-cyan : #334155;
+
+                    b1_touch := TouchArea {
+                        clicked => {
+                            root.selected_bounce_index = 1;
+                            root.bounces_changed(8);
+                        }
+                    }
+
+                    Text {
+                        text: "8";
+                        font-size: 11px;
+                        font-weight: 600;
+                        color: root.selected_bounce_index == 1 ? #0f172a : Theme.text-secondary;
+                        horizontal-alignment: center;
+                        vertical-alignment: center;
+                    }
+                }
+
+                // 12 Bounces (default)
+                Rectangle {
+                    horizontal-stretch: 1;
+                    height: 28px;
+                    border-radius: Theme.radius-sm;
+                    background: root.selected_bounce_index == 2 ? Theme.accent-cyan : (b2_touch.has-hover ? #1e293b : #0f172a);
+                    border-width: 1px;
+                    border-color: root.selected_bounce_index == 2 ? Theme.accent-cyan : #334155;
+
+                    b2_touch := TouchArea {
+                        clicked => {
+                            root.selected_bounce_index = 2;
+                            root.bounces_changed(12);
+                        }
+                    }
+
+                    Text {
+                        text: "12";
+                        font-size: 11px;
+                        font-weight: 600;
+                        color: root.selected_bounce_index == 2 ? #0f172a : Theme.text-secondary;
+                        horizontal-alignment: center;
+                        vertical-alignment: center;
+                    }
+                }
+
+                // 24 Bounces -- the old ceiling, now a mid rung
+                Rectangle {
+                    horizontal-stretch: 1;
+                    height: 28px;
+                    border-radius: Theme.radius-sm;
+                    background: root.selected_bounce_index == 3 ? Theme.accent-cyan : (b3_touch.has-hover ? #1e293b : #0f172a);
+                    border-width: 1px;
+                    border-color: root.selected_bounce_index == 3 ? Theme.accent-cyan : #334155;
+
+                    b3_touch := TouchArea {
+                        clicked => {
+                            root.selected_bounce_index = 3;
+                            root.bounces_changed(24);
+                        }
+                    }
+
+                    Text {
+                        text: "24";
+                        font-size: 11px;
+                        font-weight: 600;
+                        color: root.selected_bounce_index == 3 ? #0f172a : Theme.text-secondary;
+                        horizontal-alignment: center;
+                        vertical-alignment: center;
+                    }
+                }
+
+                // 64 Bounces -- measured 99.5% converged on the hardest case (Diamond)
+                Rectangle {
+                    horizontal-stretch: 1;
+                    height: 28px;
+                    border-radius: Theme.radius-sm;
+                    background: root.selected_bounce_index == 4 ? Theme.accent-cyan : (b4_touch.has-hover ? #1e293b : #0f172a);
+                    border-width: 1px;
+                    border-color: root.selected_bounce_index == 4 ? Theme.accent-cyan : #334155;
+
+                    b4_touch := TouchArea {
+                        clicked => {
+                            root.selected_bounce_index = 4;
+                            root.bounces_changed(64);
+                        }
+                    }
+
+                    Text {
+                        text: "64";
+                        font-size: 11px;
+                        font-weight: 600;
+                        color: root.selected_bounce_index == 4 ? #0f172a : Theme.text-secondary;
+                        horizontal-alignment: center;
+                        vertical-alignment: center;
+                    }
+                }
+
+                // 128 Bounces -- measured 99.99% converged; the ceiling, since the
+                // benchmark shows zero further image change up to 1024
+                Rectangle {
+                    horizontal-stretch: 1;
+                    height: 28px;
+                    border-radius: Theme.radius-sm;
+                    background: root.selected_bounce_index == 5 ? Theme.accent-cyan : (b5_touch.has-hover ? #1e293b : #0f172a);
+                    border-width: 1px;
+                    border-color: root.selected_bounce_index == 5 ? Theme.accent-cyan : #334155;
+
+                    b5_touch := TouchArea {
+                        clicked => {
+                            root.selected_bounce_index = 5;
+                            root.bounces_changed(128);
+                        }
+                    }
+
+                    Text {
+                        text: "128";
+                        font-size: 11px;
+                        font-weight: 600;
+                        color: root.selected_bounce_index == 5 ? #0f172a : Theme.text-secondary;
+                        horizontal-alignment: center;
+                        vertical-alignment: center;
+                    }
+                }
+            }
+
+            // Same "quiet cost hint" idiom `export_dialog.slint` uses for its sample
+            // slider (`if root.sample_exponent >= 14`) -- flat cost holds on CPU (even
+            // 128 measures under 1.4x cap-12's time), but GPU threads run in lockstep,
+            // so the few long paths in the tail stall the whole workgroup and this
+            // rung range costs noticeably more there than on CPU.
+            if root.selected_bounce_index >= 4: Text {
+                text: "Modest cost on CPU, but noticeably steeper on GPU -- long paths stall the whole workgroup there since threads run in lockstep.";
+                font-size: 9px;
+                color: Theme.text-muted;
+                wrap: word-wrap;
+            }
+        }
+
+        // Inclusion Haze: subsurface/inclusion scattering amount, off by
+        // default. Range and both endpoint meanings (barely perceptible haze / milky,
+        // heavily included) come from `GemMaterial::scattering_sigma_s`'s own doc
+        // comment (crates/gemray/src/optics/materials.rs) -- linear, unlike the
+        // samples slider above, since that field is already a physical linear
+        // coefficient. Applied via `GemMaterial::with_scattering_amount` at the
+        // render-thread level -- see `bridge::render_thread::resolve_material_and_quality`.
+        VerticalLayout {
+            spacing: 4px;
+            HorizontalLayout {
+                alignment: space-between;
+                Text { text: "Inclusion Haze"; font-size: 11px; font-weight: 600; color: Theme.text-muted; }
+                Text {
+                    text: root.inclusion_sigma_s <= 0.0 ? "Off" : Math.round(root.inclusion_sigma_s * 100.0) / 100.0 + "";
+                    font-size: 11px;
+                    font-weight: 700;
+                    color: Theme.accent-cyan;
+                }
+            }
+            Slider {
+                minimum: 0.0;
+                maximum: 3.0;
+                value <=> root.inclusion_sigma_s;
+                changed(val) => { root.inclusion_changed(val); }
+            }
+        }
+
+        // Crystal Axis Orientation: tilt/azimuth of the optic axis relative
+        // to the table normal (+Y). Off ("As Cut") by default -- leaves each
+        // material's own c_axis untouched, same off-by-default treatment as Inclusion
+        // Haze above. `c_axis_override_available` (Rust-driven -- see
+        // `gui::mod::is_c_axis_override_available`) is false for an isotropic
+        // material, which has no crystal axis to orient: the switch is disabled and
+        // greyed out rather than left to silently do nothing.
+        VerticalLayout {
+            spacing: 4px;
+            HorizontalLayout {
+                alignment: space-between;
+                Text {
+                    text: "Crystal Axis Orientation";
+                    font-size: 11px;
+                    font-weight: 600;
+                    color: root.c_axis_override_available ? Theme.text-muted : #475569;
+                }
+                Rectangle {
+                    width: 36px;
+                    height: 20px;
+                    border-radius: 10px;
+                    opacity: root.c_axis_override_available ? 1.0 : 0.5;
+                    background: root.c_axis_override_enabled ? Theme.accent-cyan : #334155;
+
+                    axis_toggle_touch := TouchArea {
+                        enabled: root.c_axis_override_available;
+                        clicked => {
+                            root.c_axis_override_enabled = !root.c_axis_override_enabled;
+                            root.c_axis_override_changed(root.c_axis_override_enabled);
+                        }
+                    }
+
+                    Rectangle {
+                        width: 16px;
+                        height: 16px;
+                        border-radius: 8px;
+                        background: white;
+                        x: root.c_axis_override_enabled ? parent.width - self.width - 2px : 2px;
+                        y: 2px;
+                        animate x { duration: 120ms; }
+                    }
+                }
+            }
+
+            if !root.c_axis_override_available: Text {
+                text: "This material is isotropic (e.g. Diamond, Spinel, Cubic Zirconia) -- it has no crystal axis to orient.";
+                font-size: 9px;
+                color: Theme.text-muted;
+                wrap: word-wrap;
+            }
+
+            if root.c_axis_override_available && root.c_axis_override_enabled: VerticalLayout {
+                spacing: 8px;
+
+                VerticalLayout {
+                    spacing: 2px;
+                    HorizontalLayout {
+                        alignment: space-between;
+                        Text { text: "Tilt"; font-size: 10px; color: Theme.text-muted; }
+                        Text { text: Math.round(root.c_axis_tilt_deg) + "°"; font-size: 10px; font-weight: 700; color: Theme.accent-cyan; }
+                    }
+                    Slider {
+                        minimum: 0.0;
+                        maximum: 90.0;
+                        value <=> root.c_axis_tilt_deg;
+                        changed(val) => { root.c_axis_angles_changed(val, root.c_axis_azimuth_deg); }
+                    }
+                }
+
+                VerticalLayout {
+                    spacing: 2px;
+                    HorizontalLayout {
+                        alignment: space-between;
+                        Text { text: "Azimuth"; font-size: 10px; color: Theme.text-muted; }
+                        Text { text: Math.round(root.c_axis_azimuth_deg) + "°"; font-size: 10px; font-weight: 700; color: Theme.accent-cyan; }
+                    }
+                    Slider {
+                        minimum: 0.0;
+                        maximum: 360.0;
+                        value <=> root.c_axis_azimuth_deg;
+                        changed(val) => { root.c_axis_angles_changed(root.c_axis_tilt_deg, val); }
+                    }
+                }
+            }
+        }
+
+        // Frosted Girdle: renders the identified girdle band with a bruted
+        // (ground, diffusely scattering) finish instead of the default polished one.
+        // Off by default -- see `RenderContext::girdle_frosted`'s own doc comment.
+        VerticalLayout {
+            spacing: 4px;
+            HorizontalLayout {
+                alignment: space-between;
+                Text { text: "Frosted Girdle"; font-size: 11px; font-weight: 600; color: Theme.text-muted; }
+                Rectangle {
+                    width: 36px;
+                    height: 20px;
+                    border-radius: 10px;
+                    background: root.girdle_frosted ? Theme.accent-cyan : #334155;
+
+                    TouchArea {
+                        clicked => {
+                            root.girdle_frosted = !root.girdle_frosted;
+                            root.girdle_frosted_changed(root.girdle_frosted);
+                        }
+                    }
+
+                    Rectangle {
+                        width: 16px;
+                        height: 16px;
+                        border-radius: 8px;
+                        background: white;
+                        x: root.girdle_frosted ? parent.width - self.width - 2px : 2px;
+                        y: 2px;
+                        animate x { duration: 120ms; }
+                    }
+                }
+            }
+        }
+
+        // Edge Rounding: softens meet-point edges from perfectly sharp
+        // (0.0, the default) toward a subtle rounded glint. Range/ceiling sourcing:
+        // see `AppSettings::edge_rounding_radius`'s own doc comment
+        // (apps/diagram-gui/src/settings/model.rs).
+        VerticalLayout {
+            spacing: 4px;
+            HorizontalLayout {
+                alignment: space-between;
+                Text { text: "Edge Rounding"; font-size: 11px; font-weight: 600; color: Theme.text-muted; }
+                Text {
+                    text: root.edge_rounding_radius <= 0.0 ? "Off" : Math.round(root.edge_rounding_radius * 1000.0) / 1000.0 + "";
+                    font-size: 11px;
+                    font-weight: 700;
+                    color: Theme.accent-cyan;
+                }
+            }
+            Slider {
+                minimum: 0.0;
+                maximum: 0.03;
+                value <=> root.edge_rounding_radius;
+                changed(val) => { root.edge_rounding_changed(val); }
+            }
+        }
+
+        // Stone Size: the physical width across the girdle, in millimetres, to
+        // treat the active design as measuring -- see `RenderContext::stone_width_mm`'s
+        // own doc comment for the mechanism. 0.0 (the default) means off: unscaled,
+        // today's look.
+        VerticalLayout {
+            spacing: 4px;
+            HorizontalLayout {
+                alignment: space-between;
+                Text { text: "Stone Size"; font-size: 11px; font-weight: 600; color: Theme.text-muted; }
+                Text {
+                    text: root.stone_width_mm <= 0.0 ? "Off" : Math.round(root.stone_width_mm * 100.0) / 100.0 + "mm";
+                    font-size: 11px;
+                    font-weight: 700;
+                    color: Theme.accent-cyan;
+                }
+            }
+            Slider {
+                minimum: 0.0;
+                maximum: 20.0;
+                value <=> root.stone_width_mm;
+                changed(val) => { root.stone_width_changed(val); }
+            }
+        }
+
+        // Environment Map (HDR): loads a Radiance .hdr equirectangular
+        // panorama as the render's environment in place of the analytic studio rig
+        // (Studio Exposure / Light Azimuth / Light Elevation below, which this
+        // supersedes while a map is loaded -- see the note further down). The path
+        // field stays typed/pasteable; "Browse..." fills it via a native OS file-open
+        // dialog filtered to `.hdr` (see `pick_hdr_file`'s own doc comment above).
+        VerticalLayout {
+            spacing: 4px;
+            Text { text: "Environment Map (HDR)"; font-size: 11px; font-weight: 600; color: Theme.text-muted; }
+
+            LineEdit {
+                placeholder-text: "C:\\path\\to\\studio.hdr";
+                text <=> root.env_map_path;
+                accepted => { root.load_env_map(root.env_map_path); }
+            }
+
+            HorizontalLayout {
+                spacing: 6px;
+
+                Rectangle {
+                    width: 76px;
+                    height: 26px;
+                    border-radius: Theme.radius-sm;
+                    background: browse_hdr_touch.has-hover ? #1e293b : #0f172a;
+                    border-width: 1px;
+                    border-color: #334155;
+
+                    browse_hdr_touch := TouchArea {
+                        clicked => { root.env_map_path = root.pick_hdr_file(root.env_map_path); }
+                    }
+
+                    Text { text: "Browse..."; font-size: 11px; font-weight: 600; color: Theme.text-secondary; horizontal-alignment: center; vertical-alignment: center; }
+                }
+
+                Rectangle {
+                    horizontal-stretch: 1;
+                    height: 26px;
+                    border-radius: Theme.radius-sm;
+                    background: load_env_touch.has-hover ? #7dd3fc : Theme.accent-cyan;
+
+                    load_env_touch := TouchArea {
+                        enabled: root.env_map_path != "";
+                        clicked => { root.load_env_map(root.env_map_path); }
+                    }
+
+                    Text { text: "Load"; font-size: 11px; font-weight: 700; color: #0f172a; horizontal-alignment: center; vertical-alignment: center; }
+                }
+
+                if root.env_map_loaded: Rectangle {
+                    width: 60px;
+                    height: 26px;
+                    border-radius: Theme.radius-sm;
+                    background: clear_env_touch.has-hover ? #1e293b : #0f172a;
+                    border-width: 1px;
+                    border-color: #334155;
+
+                    clear_env_touch := TouchArea {
+                        clicked => { root.clear_env_map(); }
+                    }
+
+                    Text { text: "Clear"; font-size: 11px; font-weight: 600; color: Theme.text-secondary; horizontal-alignment: center; vertical-alignment: center; }
+                }
+            }
+
+            if root.env_map_status != "": Text {
+                text: root.env_map_status;
+                font-size: 10px;
+                color: Theme.accent-emerald;
+                wrap: word-wrap;
+            }
+
+            // Loading an environment map forces the switch to the (slower) CPU tracer
+            // -- see `bridge::gpu_backend`'s module doc comment -- which must have a
+            // visible explanation, not just a frame-rate drop with no stated cause.
+            if root.env_map_loaded: Text {
+                text: "Replaces the studio lighting rig, exposure, and light-position controls below. Renders on the CPU only (no GPU support yet) -- expect slower, but physically accurate, results.";
+                font-size: 9px;
+                color: Theme.text-muted;
+                wrap: word-wrap;
+            }
+        }
+
+        // Studio Exposure Slider
+        VerticalLayout {
+            spacing: 4px;
+            HorizontalLayout {
+                alignment: space-between;
+                Text { text: "Studio Exposure"; font-size: 11px; font-weight: 600; color: Theme.text-muted; }
+                Text { text: Math.round(root.exposure_val * 100.0) / 100.0 + "x"; font-size: 11px; font-weight: 700; color: Theme.accent-cyan; }
+            }
+            Slider {
+                minimum: 0.4;
+                maximum: 2.5;
+                value <=> root.exposure_val;
+                changed(val) => { root.exposure_changed(val); }
+            }
+        }
+
+        // Light Source Azimuth
+        VerticalLayout {
+            spacing: 4px;
+            HorizontalLayout {
+                alignment: space-between;
+                HorizontalLayout {
+                    spacing: 5px;
+                    Image { source: @image-url("../icons/lightbulb.svg"); colorize: Theme.text-muted; width: 10px; height: 10px; vertical-alignment: center; }
+                    Text { text: "Light Azimuth"; font-size: 11px; font-weight: 600; color: Theme.text-muted; vertical-alignment: center; }
+                }
+                Text { text: Math.round(root.light_yaw_deg) + "°"; font-size: 11px; font-weight: 700; color: Theme.accent-cyan; }
+            }
+            Slider {
+                minimum: 0.0;
+                maximum: 360.0;
+                value <=> root.light_yaw_deg;
+                changed(val) => { root.light_pos_changed(val, root.light_pitch_deg); }
+            }
+        }
+
+        // Light Source Elevation
+        VerticalLayout {
+            spacing: 4px;
+            HorizontalLayout {
+                alignment: space-between;
+                HorizontalLayout {
+                    spacing: 5px;
+                    Image { source: @image-url("../icons/lightbulb.svg"); colorize: Theme.text-muted; width: 10px; height: 10px; vertical-alignment: center; }
+                    Text { text: "Light Elevation"; font-size: 11px; font-weight: 600; color: Theme.text-muted; vertical-alignment: center; }
+                }
+                Text { text: Math.round(root.light_pitch_deg) + "°"; font-size: 11px; font-weight: 700; color: Theme.accent-cyan; }
+            }
+            Slider {
+                minimum: 10.0;
+                maximum: 90.0;
+                value <=> root.light_pitch_deg;
+                changed(val) => { root.light_pos_changed(root.light_yaw_deg, val); }
+            }
+        }
+
+        // Named Lighting Presets. A preset bundles light yaw/pitch, exposure,
+        // the lighting-rig selection, and camera distance -- deliberately NOT camera
+        // yaw/pitch, so applying one never spins the gem out from under the user; see
+        // `settings::model::LightingPreset`'s doc comment for the full reasoning.
+        VerticalLayout {
+            spacing: 6px;
+            HorizontalLayout {
+                alignment: space-between;
+                Text { text: "Lighting Presets"; font-size: 11px; font-weight: 600; color: Theme.text-muted; }
+
+                Rectangle {
+                    width: 20px;
+                    height: 20px;
+                    border-radius: 4px;
+                    background: root.adding_preset ? Theme.accent-cyan : (add_preset_touch.has-hover ? #1e293b : transparent);
+
+                    add_preset_touch := TouchArea {
+                        clicked => {
+                            root.adding_preset = !root.adding_preset;
+                            root.new_preset_name = "";
+                        }
+                    }
+
+                    Image {
+                        source: @image-url("../icons/save.svg");
+                        colorize: root.adding_preset ? #0f172a : Theme.accent-cyan;
+                        width: 11px;
+                        height: 11px;
+                        horizontal-alignment: center;
+                        vertical-alignment: center;
+                    }
+                }
+            }
+
+            // Inline "save current lighting as new preset" row
+            if root.adding_preset: HorizontalLayout {
+                spacing: 6px;
+
+                Rectangle {
+                    horizontal-stretch: 1;
+                    height: 26px;
+                    background: #1e293b;
+                    border-radius: Theme.radius-sm;
+                    border-width: 1px;
+                    border-color: Theme.accent-cyan;
+
+                    LineEdit {
+                        text <=> root.new_preset_name;
+                        placeholder-text: "New preset name...";
+                    }
+                }
+
+                Rectangle {
+                    width: 26px;
+                    height: 26px;
+                    border-radius: Theme.radius-sm;
+                    background: confirm_new_touch.has-hover ? #7dd3fc : Theme.accent-cyan;
+
+                    confirm_new_touch := TouchArea {
+                        clicked => {
+                            if (root.new_preset_name != "") {
+                                root.save_lighting_preset(root.new_preset_name);
+                                root.adding_preset = false;
+                                root.new_preset_name = "";
+                            }
+                        }
+                    }
+
+                    Image { source: @image-url("../icons/check.svg"); colorize: #0f172a; width: 12px; height: 12px; horizontal-alignment: center; vertical-alignment: center; }
+                }
+            }
+
+            // Preset rows: click the name to apply; pencil/check to rename (user
+            // presets only); trash to delete (user presets only). Built-in presets
+            // (`preset.built_in`) never show rename/delete -- the Rust side refuses
+            // those operations on them anyway, but hiding the affordance avoids a
+            // round-trip just to show an error toast.
+            for preset[idx] in root.lighting_presets: Rectangle {
+                height: 28px;
+                border-radius: Theme.radius-sm;
+                background: #0f172a;
+                border-width: 1px;
+                border-color: #334155;
+
+                HorizontalLayout {
+                    padding-left: 8px;
+                    padding-right: 6px;
+                    spacing: 6px;
+
+                    Rectangle {
+                        horizontal-stretch: 1;
+
+                        apply_touch := TouchArea {
+                            enabled: root.renaming_index != idx;
+                            clicked => { root.apply_lighting_preset(idx); }
+                        }
+
+                        if root.renaming_index != idx: Text {
+                            text: preset.name;
+                            font-size: 11px;
+                            font-weight: 600;
+                            color: apply_touch.has-hover ? Theme.accent-cyan : (preset.built_in ? Theme.text-secondary : Theme.text-primary);
+                            vertical-alignment: center;
+                        }
+
+                        if root.renaming_index == idx: Rectangle {
+                            height: 22px;
+                            background: #0f172a;
+                            border-radius: 3px;
+                            border-width: 1px;
+                            border-color: Theme.accent-cyan;
+
+                            LineEdit {
+                                text <=> root.rename_text;
+                            }
+                        }
+                    }
+
+                    if !preset.built_in && root.renaming_index != idx: Rectangle {
+                        width: 18px;
+                        height: 18px;
+                        border-radius: 3px;
+                        background: rename_touch.has-hover ? #334155 : transparent;
+
+                        rename_touch := TouchArea {
+                            clicked => {
+                                root.renaming_index = idx;
+                                root.rename_text = preset.name;
+                            }
+                        }
+
+                        Image { source: @image-url("../icons/pencil.svg"); colorize: Theme.text-muted; width: 10px; height: 10px; horizontal-alignment: center; vertical-alignment: center; }
+                    }
+
+                    if root.renaming_index == idx: Rectangle {
+                        width: 18px;
+                        height: 18px;
+                        border-radius: 3px;
+                        background: confirm_rename_touch.has-hover ? #334155 : transparent;
+
+                        confirm_rename_touch := TouchArea {
+                            clicked => {
+                                if (root.rename_text != "") {
+                                    root.rename_lighting_preset(idx, root.rename_text);
+                                }
+                                root.renaming_index = -1;
+                            }
+                        }
+
+                        Image { source: @image-url("../icons/check.svg"); colorize: Theme.accent-emerald; width: 10px; height: 10px; horizontal-alignment: center; vertical-alignment: center; }
+                    }
+
+                    if !preset.built_in && root.renaming_index != idx: Rectangle {
+                        width: 18px;
+                        height: 18px;
+                        border-radius: 3px;
+                        background: delete_touch.has-hover ? #450a0a : transparent;
+
+                        delete_touch := TouchArea {
+                            clicked => { root.delete_lighting_preset(idx); }
+                        }
+
+                        Image { source: @image-url("../icons/trash.svg"); colorize: #f87171; width: 10px; height: 10px; horizontal-alignment: center; vertical-alignment: center; }
+                    }
+                }
+            }
+        }
+
+        // Performance Curve over Tilt Angles (Extinction & Brilliance Graph)
+        VerticalLayout {
+            spacing: 6px;
+            HorizontalLayout {
+                alignment: space-between;
+                HorizontalLayout {
+                    spacing: 6px;
+                    Image { source: @image-url("../icons/trend-up.svg"); colorize: Theme.text-muted; width: 11px; height: 11px; vertical-alignment: center; }
+                    Text { text: "Tilt Performance Curve"; font-size: 11px; font-weight: 600; color: Theme.text-muted; vertical-alignment: center; }
+                    Rectangle {
+                        width: 18px;
+                        height: 18px;
+                        border-radius: 3px;
+                        background: exp_touch.has-hover ? #334155 : transparent;
+                        exp_touch := TouchArea {
+                            clicked => { root.open_performance_graph(); }
+                        }
+                        Image { source: @image-url("../icons/arrow-up-right.svg"); colorize: Theme.accent-cyan; width: 11px; height: 11px; horizontal-alignment: center; vertical-alignment: center; }
+                    }
+                }
+                HorizontalLayout {
+                    spacing: 8px;
+                    HorizontalLayout {
+                        spacing: 3px;
+                        alignment: center;
+                        Rectangle { width: 7px; height: 7px; border-radius: 3px; background: Theme.accent-cyan; }
+                        Text { text: "Brilliance"; font-size: 9px; color: Theme.accent-cyan; vertical-alignment: center; }
+                    }
+                    HorizontalLayout {
+                        spacing: 3px;
+                        alignment: center;
+                        Rectangle { width: 7px; height: 7px; border-radius: 3px; background: #ef4444; }
+                        Text { text: "Extinction"; font-size: 9px; color: #ef4444; vertical-alignment: center; }
+                    }
+                }
+            }
+
+            // Interactive Mini Graph Canvas / Bar Columns
+            Rectangle {
+                height: 72px;
+                background: #090d16;
+                border-radius: Theme.radius-sm;
+                border-width: 1px;
+                border-color: #334155;
+                clip: true;
+
+                // 19 Elevation Angle Columns (0° to 90° in 5° steps)
+                HorizontalLayout {
+                    padding-left: 6px;
+                    padding-right: 6px;
+                    padding-top: 6px;
+                    padding-bottom: 4px;
+                    spacing: 2px;
+                    alignment: space-between;
+
+                    for val[idx] in root.graph_extinction : VerticalLayout {
+                        horizontal-stretch: 1;
+                        alignment: end;
+                        spacing: 2px;
+
+                        // Dual Bar Comparison: Brilliance (Cyan) & Extinction (Red)
+                        HorizontalLayout {
+                            alignment: center;
+                            spacing: 1px;
+                            Rectangle {
+                                width: 3.5px;
+                                height: max(2px, min(48px, root.graph_brilliance[idx] * 0.48px));
+                                background: Theme.accent-cyan;
+                                border-radius: 1px;
+                            }
+                            Rectangle {
+                                width: 3.5px;
+                                height: max(2px, min(48px, root.graph_extinction[idx] * 0.48px));
+                                background: #ef4444;
+                                border-radius: 1px;
+                            }
+                        }
+
+                        // Angle label below column (highlight current light elevation in 5° steps)
+                        Text {
+                            text: (Math.mod(idx, 3) == 0 || idx == 18) ? root.graph_angles[idx] + "°" : "·";
+                            font-size: 7.5px;
+                            color: Math.abs(root.light_pitch_deg - root.graph_angles_num[idx]) < 2.6 ? Theme.accent-cyan : #64748b;
+                            font-weight: Math.abs(root.light_pitch_deg - root.graph_angles_num[idx]) < 2.6 ? 700 : 400;
+                            horizontal-alignment: center;
+                        }
+                    }
+                }
+            }
+        }
+
+        // Footer Actions
+        HorizontalLayout {
+            alignment: space-between;
+            spacing: 8px;
+
+            Rectangle {
+                width: 70px;
+                height: 30px;
+                border-radius: Theme.radius-sm;
+                background: rst_touch.has-hover ? #1e293b : #0f172a;
+                border-width: 1px;
+                border-color: #334155;
+
+                rst_touch := TouchArea {
+                    clicked => { root.reset_defaults(); }
+                }
+
+                HorizontalLayout {
+                    alignment: center;
+                    spacing: 5px;
+                    Image { source: @image-url("../icons/reset.svg"); colorize: Theme.text-secondary; width: 11px; height: 11px; vertical-alignment: center; }
+                    Text { text: "Reset"; font-size: 11px; font-weight: 600; color: Theme.text-secondary; vertical-alignment: center; }
+                }
+            }
+
+            Rectangle {
+                horizontal-stretch: 1;
+                height: 30px;
+                border-radius: Theme.radius-sm;
+                background: done_touch.has-hover ? #7dd3fc : Theme.accent-cyan;
+
+                done_touch := TouchArea {
+                    clicked => { root.close(); }
+                }
+
+                Text { text: "Done"; font-size: 12px; font-weight: 700; color: #0f172a; horizontal-alignment: center; vertical-alignment: center; }
+            }
+        }
+    }
+    }
+}

@@ -1,0 +1,716 @@
+import { DiagramItem, AngleItem, FileItem, DiagramDetailData, OpticalMetricsData, LightingPresetItem, WorkerItem } from "types.slint";
+import { Theme } from "theme.slint";
+import { HeaderToolbar } from "components/header.slint";
+import { DiagramListView } from "components/diagram_list.slint";
+import { DetailHeaderView } from "components/detail_header.slint";
+import { MetadataEditorDialog } from "components/metadata_editor_dialog.slint";
+import { GemViewportView } from "components/gem_viewport.slint";
+import { CuttingTableView } from "components/cutting_table.slint";
+import { AttachmentsView } from "components/attachments_view.slint";
+import { Toast } from "components/toast.slint";
+
+export { DiagramItem, AngleItem, FileItem, DiagramDetailData, OpticalMetricsData, LightingPresetItem, WorkerItem }
+
+export component MainWindow inherits Window {
+    title: "Facet Diagrams Studio — Physically Based Gem Explorer";
+    preferred-width: 1280px;
+    preferred-height: 800px;
+    background: Theme.bg-darkest;
+    // `default-font-family` takes a single font family name (it's resolved by the platform font
+    // matcher, not a CSS-style comma-separated fallback stack) -- a stack string fails to match
+    // any installed family and silently falls back to Slint's built-in default font.
+    default-font-family: "Segoe UI";
+
+    in-out property <string> search_text: "";
+    in property <[string]> shape_options: ["All Shapes"];
+    in-out property <int> selected_shape_index: 0;
+    in property <[string]> gear_options: ["All Gears"];
+    in-out property <int> selected_gear_index: 0;
+    in property <string> status_message: "Database ready.";
+
+    // Range filter bounds (actual catalogue min/max, set once at startup -- see
+    // `gui/mod.rs::sync_range_bounds_to_ui`) and current filter values, one pair per
+    // attribute. A filter value sitting exactly on its bound edge means "unfiltered"
+    // on that side -- see `gui/search.rs::active_bound` -- which is also what
+    // `HeaderToolbar`'s Reset button restores.
+    in property <float> ri_bounds_min: 1.0;
+    in property <float> ri_bounds_max: 3.0;
+    in-out property <float> ri_filter_min: 1.0;
+    in-out property <float> ri_filter_max: 3.0;
+    in property <float> lw_bounds_min: 1.0;
+    in property <float> lw_bounds_max: 3.0;
+    in-out property <float> lw_filter_min: 1.0;
+    in-out property <float> lw_filter_max: 3.0;
+    in property <float> volume_bounds_min: 0.0;
+    in property <float> volume_bounds_max: 1.0;
+    in-out property <float> volume_filter_min: 0.0;
+    in-out property <float> volume_filter_max: 1.0;
+    in property <float> facets_bounds_min: 0.0;
+    in property <float> facets_bounds_max: 200.0;
+    in-out property <float> facets_filter_min: 0.0;
+    in-out property <float> facets_filter_max: 200.0;
+    in property <bool> is_busy: false;
+    in property <int> selected_entry_id: -1;
+    in-out property <int> active_tab: 0; // 0: 3D Gem, 1: Cutting Table, 2: Attachments
+    // Hoisted to MainWindow (rather than living only inside GemViewportView) because that view
+    // is conditionally instantiated per-tab below and gets destroyed/recreated on every tab
+    // switch -- a property local to it would silently reset to its default, desyncing the
+    // button's displayed state from the render thread's actual `paused` flag.
+    in-out property <bool> render_paused: false;
+    // Rendering-settings state hoisted here for the same reason as `render_paused`
+    // above: settings must survive a tab switch, and be settable from Rust at
+    // startup to restore saved values -- neither works for a property that lives only
+    // inside the conditionally-instantiated `GemViewportView`/`SettingsDialog`.
+    // Replaces the old four-tier `quality_index` pill selector with a single
+    // "Target Samples" slider. Carries the slider's EXPONENT (3..=10 => 8..1024
+    // samples), not the sample count itself -- image noise falls as 1/sqrt(N), so a
+    // linear count control would spend ~97% of its travel above 32 spp where each
+    // step barely changes anything visible. `gui::sample_scale` (Rust) converts to/from
+    // the persisted count. Default 8.0 => 256 samples, matching
+    // `settings::model::DEFAULT_TARGET_SAMPLES`.
+    in-out property <float> target_samples_exponent: 8.0;
+    // Live render resolution pill index (`RenderContext.width`/`.height` are now
+    // user-controlled instead of a fixed 800x600 -- see `resolution_changed`'s doc
+    // comment below). 0: 640x480, 1: 800x600 (default, matches
+    // `RenderContext::default()`/`settings::model::DEFAULT_RENDER_WIDTH`), 2: 1280x720,
+    // 3: 1920x1080.
+    in-out property <int> resolution_index: 1;
+    // Local preview-then-settle rendering: while the camera is moving, trace
+    // at a fraction of "Render Resolution" above (`gui::mod::LocalPreviewScale`'s
+    // `Off`/`Half`/`Quarter`), then snap back to full resolution once it settles. A
+    // discrete pill index (0: Off/default, 1: Half, 2: Quarter), not a slider -- see
+    // `local_preview_scale_changed`'s own doc comment below for why. Off by default,
+    // matching every other opt-in control in this file: reproduces this crate's
+    // pre-existing behaviour exactly for anyone who never opens this control.
+    in-out property <int> local_preview_scale_index: 0;
+    // Live rendering's Local/Remote/Local+Remote choice: once the camera settles,
+    // which engine(s) contribute to the viewport image -- see
+    // `live_compute_target_changed`'s own doc comment below. `2` (Local + Remote)
+    // matches `settings::model::worker::LiveComputeTarget`'s own `Default`.
+    in-out property <int> live_compute_target_index: 2;
+    in-out property <int> bounce_index: 2; // 12 Bounces -- see settings_dialog.slint's pill ladder (4/8/12/24/64/128)
+    in-out property <float> exposure_val: 1.0;
+    in-out property <float> light_yaw_deg: 48.0;
+    in-out property <float> light_pitch_deg: 54.0;
+    // Inclusion/subsurface scattering amount, off by default. Range and both
+    // endpoint meanings (barely perceptible haze / milky-heavily-included) come from
+    // `GemMaterial::scattering_sigma_s`'s own doc comment
+    // (crates/gemray/src/optics/materials.rs).
+    in-out property <float> inclusion_sigma_s: 0.0;
+    // Crystal-axis orientation override, off ("as cut") by default -- leaves
+    // the resolved material's own `c_axis` untouched, same off-by-default treatment as
+    // `inclusion_sigma_s` above. `c_axis_tilt_deg` (0-90, tilt from the table normal)
+    // and `c_axis_azimuth_deg` (0-360, rotation around the table normal) only take
+    // effect while this is on -- see `gui::c_axis`'s module doc comment for the
+    // angle-to-vector mapping. `c_axis_override_available` (Rust-driven, not
+    // user-settable) is `false` for an isotropic material, whose optic axis is
+    // physically meaningless -- `settings_dialog.slint` greys the control out and
+    // explains why rather than letting the user drag a slider that does nothing.
+    in-out property <bool> c_axis_override_enabled: false;
+    in-out property <float> c_axis_tilt_deg: 0.0;
+    in-out property <float> c_axis_azimuth_deg: 0.0;
+    in property <bool> c_axis_override_available: true;
+    // Bruted (frosted) girdle finish toggle, off by default -- see
+    // `RenderContext::girdle_frosted`'s own doc comment.
+    in-out property <bool> girdle_frosted: false;
+    // Facet edge (meet-point) rounding radius, off (perfectly sharp edges) by
+    // default -- see `RenderContext::edge_rounding_radius`'s own doc comment for the
+    // `0.0`-`0.03` range's sourcing.
+    in-out property <float> edge_rounding_radius: 0.0;
+    // Physical stone size (girdle width, mm), off (unscaled, today's look) by
+    // default -- see `RenderContext::stone_width_mm`'s own doc comment.
+    in-out property <float> stone_width_mm: 0.0;
+    // HDR environment map -- the typed path field's live text (`env_map_path`),
+    // plus two Rust-driven read-outs: `env_map_status` ("Loaded:
+    // <file> (WxH)", or empty when nothing is loaded) and `env_map_loaded` (whether the
+    // settings dialog shows its Clear button and CPU-only note). `gui::mod`'s
+    // `apply_loaded_settings` seeds `env_map_path` from the last-loaded path at
+    // startup; the load/clear callbacks below are the only things that change
+    // `env_map_status`/`env_map_loaded` afterwards.
+    in-out property <string> env_map_path: "";
+    in property <string> env_map_status: "";
+    in property <bool> env_map_loaded: false;
+
+    // Named lighting presets.
+    in property <[LightingPresetItem]> lighting_presets: [];
+
+    // Local-library import popup's last result text (see `import_dialog.slint`).
+    in property <string> import_result_text: "";
+    // Progress for the import currently running -- see `HeaderToolbar`'s own
+    // `import_done`/`import_total`/`import_progress` doc comment.
+    in property <int> import_done: 0;
+    in property <int> import_total: 0;
+    in property <float> import_progress: 0.0;
+
+    // Remote rendering: the worker-list panel's state (see `HeaderToolbar`'s own doc
+    // comment on why it's hoisted here rather than local to the panel).
+    in property <[WorkerItem]> remote_workers: [];
+    // Whether the live rendering "Live Compute" picker's Remote/Local+Remote pills are
+    // usable -- `settings_dialog.slint`'s own `live_remote_available` doc comment
+    // explains why this is a plain "is a worker configured at all" check rather than a
+    // live reachability probe like `export_remote_available`'s: derived directly from
+    // `remote_workers` here (never set from Rust) since the live path already retries
+    // and gracefully falls back on a real connection failure at every settle, so a
+    // config-only bar is truthful enough for "is there anything to try".
+    property <bool> live_remote_available: root.remote_workers.length > 0;
+    in-out property <bool> denoise_enabled: true;
+    // Remote render sample budget -- carries the "Remote Render Samples"
+    // slider's EXPONENT (`gui::remote::REMOTE_SAMPLES_MIN_EXPONENT..=MAX_EXPONENT`,
+    // 128..=8192 samples), the same treatment `target_samples_exponent` above gives
+    // the local interactive target's own slider. Default `9.0` => 512 samples,
+    // matching `settings::model::DEFAULT_REMOTE_RENDER_SAMPLES` (unchanged from the
+    // value this used to be hardcoded to before this control existed).
+    in-out property <float> remote_render_samples_exponent: 9.0;
+    in property <int> testing_worker_index: -1;
+    in property <string> test_connection_result: "";
+    in property <int> test_connection_result_index: -1;
+    in property <bool> test_connection_is_error: false;
+    in property <bool> served_by_remote: false;
+    in property <string> served_by_worker_name: "";
+
+    // The library-browsing source, distinct from `served_by_remote` above
+    // (which is about which backend RENDERED the image currently on screen).
+    // `library_source_worker_index` is -1 for the local database, or an index into
+    // `remote_workers` -- the same "index is identity" convention `editing_index`/
+    // `testing_worker_index` already use. `library_source_label`/`library_is_remote`
+    // are the always-visible "which library am I looking at" badge (see
+    // `header.slint`'s own doc comment) -- computed in Rust
+    // (`bridge::library_source::LibrarySource::label`) rather than re-derived here, so
+    // there is exactly one place that decides what the label says.
+    in property <int> library_source_worker_index: -1;
+    in property <string> library_source_label: "Local library";
+    in property <bool> library_is_remote: false;
+
+    // Pull-mirror sync progress -- see `bridge::library_mirror`'s module doc
+    // comment. `mirror_worker_index` is the row currently mirroring (or -1); a second
+    // "Mirror to local" click on a DIFFERENT row while one is already running is simply
+    // disabled in the UI (`remote_worker_dialog.slint`) rather than queued -- one sync
+    // at a time keeps the progress/cancel affordance unambiguous.
+    in property <int> mirror_worker_index: -1;
+    in property <bool> mirror_in_progress: false;
+    in property <float> mirror_progress_fraction: 0.0;
+    in property <string> mirror_status_text: "";
+    in property <bool> mirror_has_error: false;
+
+    // Token-based worker enrollment: redeem a `gemray-worker cert issue-token` token
+    // directly, instead of requiring the worker binary and a terminal (see
+    // `bridge::enroll`'s module doc comment). Mirrors `testing_worker_index`/
+    // `test_connection_result*` above -- `claim_result_index` is the row the result
+    // belongs to (an existing worker's index, or `workers.length` for the add form),
+    // matching `editing_index`'s own convention in `remote_worker_dialog.slint`.
+    in property <bool> claiming_token: false;
+    in property <string> claim_result_text: "";
+    in property <int> claim_result_index: -1;
+    in property <bool> claim_result_is_error: false;
+    // Non-empty exactly when a claim just succeeded: the freshly written bundle
+    // directory, which the dialog auto-fills into its cert_dir field so the user never
+    // has to type or choose a path.
+    in property <string> claimed_cert_dir: "";
+
+    // High-resolution export. Hoisted (not local to GemViewportView/ExportDialog)
+    // so an in-progress export's progress/cancel UI survives switching away from the 3D
+    // tab and back -- the export itself runs on its own worker thread regardless.
+    in-out property <bool> export_open: false;
+    in property <bool> is_exporting: false;
+    in property <float> export_progress: 0.0;
+    in property <string> export_status_message: "";
+    in property <bool> export_has_error: false;
+    in property <image> export_preview_image;
+    in property <int> export_preview_samples_done: 0;
+    in property <int> export_preview_samples_total: 0;
+    // Remote compute availability for the export dialog's "Compute" pill -- see
+    // `export_dialog.slint`'s matching property doc comments.
+    in property <bool> export_remote_available: false;
+    in property <string> export_remote_unavailable_reason: "";
+
+    in property <[DiagramItem]> diagram_list: [];
+    in property <int> total_count: 0;
+    in property <DiagramDetailData> current_detail;
+    // Detail header's shape picker: the current library's shape vocabulary
+    // (`Database::get_unique_shapes`, recomputed every time a design is opened) and
+    // which entry matches this design's own shape (-1 for unclassified) -- see
+    // `library::build_shape_picker_options`'s doc comment.
+    in property <[string]> shape_picker_options: [];
+    in property <int> shape_picker_current_index: -1;
+    // Metadata editor modal (`metadata_editor_dialog.slint`) -- hosted here, not
+    // inside `DetailHeaderView`, because that component's own `Rectangle` sizes to
+    // its content, not the full window, and a modal backdrop needs the latter (see
+    // `Toast` below for the same "floating overlay lives at the root" convention).
+    // Opened by `DetailHeaderView`'s `edit_metadata` callback below.
+    in-out property <bool> metadata_editor_open: false;
+    in property <[AngleItem]> current_angles: [];
+    in property <[FileItem]> current_files: [];
+    in property <image> render_image;
+    in property <bool> has_render: false;
+
+    in property <[string]> material_options: ["Diamond", "Sapphire", "Ruby", "Emerald", "Zircon", "Tanzanite", "Moissanite", "Topaz", "Spinel", "Quartz"];
+    in-out property <int> selected_material_index: 0;
+    // This list is what actually reaches the ComboBox (GemViewportView's own richer
+    // 4-entry default below is overridden by the explicit
+    // `lighting_options: root.lighting_options` binding in its instantiation further
+    // down) -- it used to be missing "Dramatic Dark Spotlight" even though
+    // `gemray::optics::raytracer::trace_spectral_ray` has always recognized it by name.
+    // A built-in lighting preset that selects that rig would otherwise be unreachable
+    // from the dropdown itself.
+    //
+    // "D65 Daylight (5500K)" was mislabelled -- D65 is 6500K, and every
+    // numeric branch in `sample_studio_environment`/`illuminant_temperature_k` always
+    // used 6500K for this preset (see `gemray::optics::LightingPreset::label`, the
+    // single source of truth this list's order/labels must now match). This list's
+    // ORDER is load-bearing: it must match `LightingPreset::ALL` (`Daylight`,
+    // `Incandescent`, `RingLights`, `DarkSpotlight`) exactly, since `lighting_changed`
+    // below now carries the selected INDEX, not the label text.
+    in property <[string]> lighting_options: ["D65 Daylight (6500K)", "Incandescent (3200K)", "Gem Studio Ring Lights", "Dramatic Dark Spotlight"];
+    in-out property <int> selected_lighting_index: 0;
+
+    in property <float> brilliance_pct: 0.0;
+    in property <float> fire_index: 0.0;
+    in property <float> scintillation_pct: 0.0;
+    in property <float> windowing_pct: 0.0;
+    in property <float> extinction_pct: 0.0;
+    in property <[float]> graph_brilliance: [20.0, 25.0, 32.0, 42.0, 50.0, 58.0, 65.0, 72.0, 78.0, 82.0, 84.0, 85.0, 84.0, 82.0, 80.0, 76.0, 70.0, 62.0, 50.0];
+    in property <[float]> graph_extinction: [65.0, 58.0, 50.0, 40.0, 32.0, 25.0, 18.0, 14.0, 10.0, 8.0, 6.0, 5.0, 6.0, 7.0, 9.0, 12.0, 18.0, 26.0, 38.0];
+    in property <[float]> graph_windowing: [40.0, 35.0, 28.0, 20.0, 15.0, 10.0, 8.0, 6.0, 5.0, 4.0, 4.0, 5.0, 6.0, 8.0, 10.0, 14.0, 18.0, 24.0, 30.0];
+    // SVG path-data strings (0..100 x 0..100 viewbox) for the same three curves,
+    // built by `curve_path::tilt_curve_path` -- see `performance_graph_dialog.slint`'s
+    // "High-Resolution 19-Column Performance Chart Canvas" section for how they're drawn.
+    in property <string> graph_brilliance_path: "";
+    in property <string> graph_extinction_path: "";
+    in property <string> graph_windowing_path: "";
+    // The Tilt Performance dialog's other three camera azimuths (45/90/135 deg) --
+    // see `performance_graph_dialog.slint`'s matching properties and `gui::
+    // tilt_profile`, which computes these lazily, off the UI thread, only while that
+    // dialog is open.
+    in property <[[float]]> graph_brilliance_extra_axes: [];
+    in property <[[float]]> graph_extinction_extra_axes: [];
+    in property <[[float]]> graph_windowing_extra_axes: [];
+    in property <[string]> graph_brilliance_extra_paths: [];
+    in property <[string]> graph_extinction_extra_paths: [];
+    in property <[string]> graph_windowing_extra_paths: [];
+    in property <bool> extra_axes_loading: false;
+    in property <float> cam_pitch_deg: 45.0;
+
+    in property <string> toast_message: "";
+    in-out property <bool> toast_visible: false;
+    in property <string> toast_type: "info";
+
+    // Callbacks
+    callback search_changed(string);
+    callback filter_shape_changed(string);
+    callback filter_gear_changed(string);
+    // Fired whenever a range-filter slider moves or Reset is pressed.
+    callback filters_changed();
+    callback select_diagram(int);
+    // Pick-and-import in one step -- see `header.slint`'s own declarations of these
+    // for the forwarding chain down to `ImportDialog`. `pick_asc_folder` carries
+    // whether to recurse into subfolders (Task: FEATURE 3).
+    callback pick_asc_file();
+    callback pick_asc_folder(bool);
+    // Native folder picker for `RemoteWorkerDialog`'s certificate-bundle field --
+    // unlike the two above, this one still just fills a text field, so it keeps its
+    // path-in/path-out shape.
+    callback pick_cert_dir(string) -> string;
+    callback rename_diagram(string);
+    // Detail header's shape picker -- see `library::setup_set_shape_callback`'s doc
+    // comment.
+    callback set_shape(string);
+    callback delete_diagram();
+    callback export_asc();
+    // Metadata editor modal's Save -- title, designer, shape, refractive_index,
+    // index_gear, facets_count, symmetry_order, mirror_symmetry, lw_ratio, hw_ratio,
+    // cw_ratio, pw_ratio, volume. See `gui::detail::setup_save_metadata_callback`'s
+    // own doc comment for how this is persisted without the `FullDiagramRecord`
+    // subset trap `set_shape`'s fallback path above has to work around.
+    callback save_metadata(string, string, string, string, string, string, string, bool, string, string, string, string, string);
+    callback export_file(string);
+    callback open_diagram_url(string);
+    callback copy_text(string);
+    callback camera_orbit(float, float);
+    callback camera_zoom(float);
+    callback light_move(float, float);
+    callback light_pos_changed(float, float);
+    callback reset_camera();
+    callback material_changed(string);
+    // Carries the selected preset's INDEX (into `lighting_options` /
+    // `gemray::optics::LightingPreset::ALL`), not its display string -- mapped to the
+    // enum once, at the Rust boundary in `gui/mod.rs`.
+    callback lighting_changed(int);
+    // Carries the "Target Samples" slider's EXPONENT (3..=10), not the sample
+    // count -- see `target_samples_exponent`'s own doc comment above.
+    callback target_samples_changed(int);
+    // Live render resolution: carries the resolved (width, height) pair directly, a
+    // fixed list of pill choices rather than a slider (see `settings_dialog.slint`'s
+    // `resolution_index`/`resolution_changed` doc comments for why -- Slint never
+    // reports the viewport `Image`'s actual on-screen size back to Rust, so this offers
+    // a fixed list instead of tracking it; a deliberate scoping decision).
+    callback resolution_changed(int, int);
+    // Local preview-then-settle rendering: carries the pill's clicked index
+    // directly, same int-discriminant treatment as `bounces_changed` below. See
+    // `gui::mod::local_preview_scale_from_index` (Rust) for the one boundary crossing
+    // from "pill position" to the actual `LocalPreviewScale` that's stored/rendered.
+    callback local_preview_scale_changed(int);
+    // Live rendering's Local/Remote/Local+Remote choice: carries the pill's clicked
+    // index directly, same treatment `local_preview_scale_changed` above already gives
+    // its own pill selector. See `gui::remote::live_compute_target_from_index` (Rust)
+    // for the one boundary crossing from "pill position" to the actual
+    // `LiveComputeTarget` that's stored/rendered.
+    callback live_compute_target_changed(int);
+    // HDR environment map -- carries the typed path field's text (this one has no
+    // pick-and-act-immediately shortcut the way the `.asc` import pickers above do;
+    // `pick_hdr_file` below only fills the field, `load_env_map` is a separate step).
+    // See `env_map_path`'s own doc comment above.
+    callback load_env_map(string);
+    // Native file-open picker for `env_map_path` above -- see
+    // `settings_dialog.slint`'s own `pick_hdr_file` doc comment.
+    callback pick_hdr_file(string) -> string;
+    callback clear_env_map();
+    callback bounces_changed(int);
+    callback exposure_changed(float);
+    // Inclusion/subsurface scattering amount -- carries the raw value
+    // directly (linear, unlike the samples slider above), same treatment as
+    // `exposure_changed`.
+    callback inclusion_changed(float);
+    // Crystal-axis orientation override. `c_axis_angles_changed` carries BOTH
+    // angles (the moved slider's new value plus the other slider's own current value)
+    // -- same two-values-per-callback treatment `light_pos_changed` above already gives
+    // light yaw/pitch.
+    callback c_axis_override_changed(bool);
+    callback c_axis_angles_changed(float, float);
+    // Bruted (frosted) girdle finish -- a plain on/off switch, not a slider.
+    callback girdle_frosted_changed(bool);
+    // Facet edge rounding radius -- carries the raw value directly, same
+    // treatment as `inclusion_changed` above.
+    callback edge_rounding_changed(float);
+    // Physical stone size (girdle width, mm) -- carries the raw value directly,
+    // same treatment as `edge_rounding_changed` above.
+    callback stone_width_changed(float);
+    callback copy_metrics();
+    callback copy_curve_data();
+    // See `GemViewportView`'s matching callback doc comment -- forwarded straight
+    // through so `gui::tilt_profile` (wired on `MainWindow`) hears it.
+    callback request_tilt_profile_axes();
+    // name, ri, dispersion, birefringence, color_idx, crystal_system_idx,
+    // optical_character_idx, biaxial_delta_beta_alpha -- see
+    // `MaterialEditorDialog.save_material`'s own callback doc comment.
+    callback save_custom_material(string, float, float, float, int, int, int, float);
+    callback delete_custom_material(string);
+    callback copy_cutting_table();
+    callback copy_cutting_row(int);
+    callback active_tab_changed(int);
+    callback pause_toggled(bool);
+    // Named lighting presets
+    callback save_lighting_preset(string);
+    callback apply_lighting_preset(int);
+    callback rename_lighting_preset(int, string);
+    callback delete_lighting_preset(int);
+    // High-resolution export. 4th argument (wide-gamut export) is the "Colour Space" pill's index
+    // (0: sRGB default / 1: Display P3 / 2: Rec.2020) -- see `export_dialog.slint`'s
+    // `selected_color_space_index`/`bridge::export_thread`'s module doc comment for
+    // what it drives. 5th argument is the "Compute" pill's index (0: Local only /
+    // 1: Remote only / 2: Local + Remote) -- see `export_dialog.slint`'s
+    // `compute_target`/`bridge::export_thread::ComputeTarget`'s doc comments.
+    callback start_export(int, int, int, int, int);
+    callback cancel_export();
+    // Probes the first configured remote worker's render capacity for the export
+    // dialog's "Compute" pill -- fired every time that dialog opens (see
+    // `gem_viewport.slint`'s `changed export_open` handler); `gui::render_export`
+    // reports the result into `export_remote_available`/`export_remote_unavailable_reason`
+    // above.
+    callback check_remote_availability();
+    // Remote rendering
+    callback denoise_toggled(bool);
+    // Carries the slider's EXPONENT, not the resolved sample count -- see
+    // `remote_render_samples_exponent`'s own doc comment above.
+    callback remote_render_samples_changed(int);
+    callback test_worker_connection(int, string, string);
+    callback save_worker(int, WorkerItem);
+    callback remove_worker(int);
+    // (row index, worker name, enrollment address, token) -- see `claiming_token`'s own
+    // doc comment above.
+    callback claim_token(int, string, string, string);
+    // Library source switching + pull-mirror sync. `switch_library_source`
+    // carries -1 for local or an index into `remote_workers` -- see
+    // `library_source_worker_index`'s own doc comment. `start_mirror_sync`/
+    // `cancel_mirror_sync` drive `bridge::library_mirror` the same way `start_export`/
+    // `cancel_export` above drive `bridge::export_thread`.
+    callback switch_library_source(int);
+    callback start_mirror_sync(int);
+    callback cancel_mirror_sync();
+
+    VerticalLayout {
+        padding: 12px;
+        spacing: 12px;
+
+        // 1. TOP HEADER TOOLBAR
+        HeaderToolbar {
+            search_text <=> root.search_text;
+            shape_options: root.shape_options;
+            selected_shape_index <=> root.selected_shape_index;
+            gear_options: root.gear_options;
+            selected_gear_index <=> root.selected_gear_index;
+            is_busy: root.is_busy;
+            status_message: root.status_message;
+            ri_bounds_min: root.ri_bounds_min;
+            ri_bounds_max: root.ri_bounds_max;
+            ri_filter_min <=> root.ri_filter_min;
+            ri_filter_max <=> root.ri_filter_max;
+            lw_bounds_min: root.lw_bounds_min;
+            lw_bounds_max: root.lw_bounds_max;
+            lw_filter_min <=> root.lw_filter_min;
+            lw_filter_max <=> root.lw_filter_max;
+            volume_bounds_min: root.volume_bounds_min;
+            volume_bounds_max: root.volume_bounds_max;
+            volume_filter_min <=> root.volume_filter_min;
+            volume_filter_max <=> root.volume_filter_max;
+            facets_bounds_min: root.facets_bounds_min;
+            facets_bounds_max: root.facets_bounds_max;
+            facets_filter_min <=> root.facets_filter_min;
+            facets_filter_max <=> root.facets_filter_max;
+            matched_count: root.diagram_list.length;
+            total_count: root.total_count;
+            import_result_text: root.import_result_text;
+            import_done: root.import_done;
+            import_total: root.import_total;
+            import_progress: root.import_progress;
+            remote_workers: root.remote_workers;
+            denoise_enabled: root.denoise_enabled;
+            remote_render_samples_exponent <=> root.remote_render_samples_exponent;
+            testing_worker_index: root.testing_worker_index;
+            test_connection_result: root.test_connection_result;
+            test_connection_result_index: root.test_connection_result_index;
+            test_connection_is_error: root.test_connection_is_error;
+            served_by_remote: root.served_by_remote;
+            served_by_worker_name: root.served_by_worker_name;
+            claiming_token: root.claiming_token;
+            claim_result_text: root.claim_result_text;
+            claim_result_index: root.claim_result_index;
+            claim_result_is_error: root.claim_result_is_error;
+            claimed_cert_dir: root.claimed_cert_dir;
+            library_source_worker_index: root.library_source_worker_index;
+            library_source_label: root.library_source_label;
+            library_is_remote: root.library_is_remote;
+            mirror_worker_index: root.mirror_worker_index;
+            mirror_in_progress: root.mirror_in_progress;
+            mirror_progress_fraction: root.mirror_progress_fraction;
+            mirror_status_text: root.mirror_status_text;
+            mirror_has_error: root.mirror_has_error;
+
+            search_changed(txt) => { root.search_changed(txt); }
+            filter_shape_changed(sh) => { root.filter_shape_changed(sh); }
+            filter_gear_changed(gr) => { root.filter_gear_changed(gr); }
+            pick_asc_file => { root.pick_asc_file(); }
+            pick_asc_folder(recurse) => { root.pick_asc_folder(recurse); }
+            pick_cert_dir(cur) => { root.pick_cert_dir(cur) }
+            clear_search => { root.search_changed(""); }
+            filters_changed => { root.filters_changed(); }
+            denoise_toggled(enabled) => { root.denoise_toggled(enabled); }
+            remote_render_samples_changed(exp) => { root.remote_render_samples_changed(exp); }
+            test_worker_connection(idx, address, cert_dir) => { root.test_worker_connection(idx, address, cert_dir); }
+            save_worker(idx, worker) => { root.save_worker(idx, worker); }
+            remove_worker(idx) => { root.remove_worker(idx); }
+            claim_token(idx, name, addr, token) => { root.claim_token(idx, name, addr, token); }
+            switch_library_source(idx) => { root.switch_library_source(idx); }
+            start_mirror_sync(idx) => { root.start_mirror_sync(idx); }
+            cancel_mirror_sync => { root.cancel_mirror_sync(); }
+        }
+
+        // 2. MAIN SPLIT WORKSPACE
+        HorizontalLayout {
+            spacing: 12px;
+
+            // Left: Diagram Browser List
+            DiagramListView {
+                diagram_list: root.diagram_list;
+                total_count: root.total_count;
+                selected_entry_id: root.selected_entry_id;
+
+                select_diagram(id) => { root.select_diagram(id); }
+            }
+
+            // Right: Detail Area (Header + Tab Content)
+            VerticalLayout {
+                horizontal-stretch: 1;
+                spacing: 12px;
+
+                // Detail Header & Metadata
+                DetailHeaderView {
+                    detail: root.current_detail;
+                    active_tab <=> root.active_tab;
+                    shape_options: root.shape_picker_options;
+                    shape_current_index: root.shape_picker_current_index;
+
+                    open_url(url) => { root.open_diagram_url(url); }
+                    copy_url(url) => { root.copy_text(url); }
+                    copy_title(title) => { root.copy_text(title); }
+                    tab_selected(tab) => { root.active_tab = tab; root.active_tab_changed(tab); }
+                    rename_diagram(title) => { root.rename_diagram(title); }
+                    set_shape(shape) => { root.set_shape(shape); }
+                    delete_diagram => { root.delete_diagram(); }
+                    export_asc => { root.export_asc(); }
+                    edit_metadata => { root.metadata_editor_open = true; }
+                }
+
+                // Tab 0: 3D Spectral Gemstone Viewport
+                if root.active_tab == 0: GemViewportView {
+                    render_image: root.render_image;
+                    has_render: root.has_render;
+                    material_options: root.material_options;
+                    selected_material_index <=> root.selected_material_index;
+                    lighting_options: root.lighting_options;
+                    selected_lighting_index <=> root.selected_lighting_index;
+                    brilliance_pct: root.brilliance_pct;
+                    fire_index: root.fire_index;
+                    scintillation_pct: root.scintillation_pct;
+                    windowing_pct: root.windowing_pct;
+                    extinction_pct: root.extinction_pct;
+                    graph_brilliance: root.graph_brilliance;
+                    graph_extinction: root.graph_extinction;
+                    graph_windowing: root.graph_windowing;
+                    graph_brilliance_path: root.graph_brilliance_path;
+                    graph_extinction_path: root.graph_extinction_path;
+                    graph_windowing_path: root.graph_windowing_path;
+                    graph_brilliance_extra_axes: root.graph_brilliance_extra_axes;
+                    graph_extinction_extra_axes: root.graph_extinction_extra_axes;
+                    graph_windowing_extra_axes: root.graph_windowing_extra_axes;
+                    graph_brilliance_extra_paths: root.graph_brilliance_extra_paths;
+                    graph_extinction_extra_paths: root.graph_extinction_extra_paths;
+                    graph_windowing_extra_paths: root.graph_windowing_extra_paths;
+                    extra_axes_loading: root.extra_axes_loading;
+                    cam_pitch_deg: root.cam_pitch_deg;
+                    render_paused <=> root.render_paused;
+                    target_samples_exponent <=> root.target_samples_exponent;
+                    resolution_index <=> root.resolution_index;
+                    local_preview_scale_index <=> root.local_preview_scale_index;
+                    live_compute_target_index <=> root.live_compute_target_index;
+                    live_remote_available: root.live_remote_available;
+                    bounce_index <=> root.bounce_index;
+                    exposure_val <=> root.exposure_val;
+                    light_yaw_deg <=> root.light_yaw_deg;
+                    light_pitch_deg <=> root.light_pitch_deg;
+                    inclusion_sigma_s <=> root.inclusion_sigma_s;
+                    c_axis_override_enabled <=> root.c_axis_override_enabled;
+                    c_axis_tilt_deg <=> root.c_axis_tilt_deg;
+                    c_axis_azimuth_deg <=> root.c_axis_azimuth_deg;
+                    c_axis_override_available: root.c_axis_override_available;
+                    girdle_frosted <=> root.girdle_frosted;
+                    edge_rounding_radius <=> root.edge_rounding_radius;
+                    stone_width_mm <=> root.stone_width_mm;
+                    env_map_path <=> root.env_map_path;
+                    env_map_status: root.env_map_status;
+                    env_map_loaded: root.env_map_loaded;
+                    lighting_presets: root.lighting_presets;
+                    export_open <=> root.export_open;
+                    is_exporting: root.is_exporting;
+                    export_progress: root.export_progress;
+                    export_status_message: root.export_status_message;
+                    export_has_error: root.export_has_error;
+                    export_preview_image: root.export_preview_image;
+                    export_preview_samples_done: root.export_preview_samples_done;
+                    export_preview_samples_total: root.export_preview_samples_total;
+                    export_remote_available: root.export_remote_available;
+                    export_remote_unavailable_reason: root.export_remote_unavailable_reason;
+
+                    camera_orbit(dx, dy) => { root.camera_orbit(dx, dy); }
+                    camera_zoom(delta) => { root.camera_zoom(delta); }
+                    light_move(dx, dy) => { root.light_move(dx, dy); }
+                    light_pos_changed(y, p) => { root.light_pos_changed(y, p); }
+                    reset_camera => { root.reset_camera(); }
+                    material_changed(mat) => { root.material_changed(mat); }
+                    lighting_changed(idx) => { root.lighting_changed(idx); }
+                    target_samples_changed(exp) => { root.target_samples_changed(exp); }
+                    resolution_changed(w, h) => { root.resolution_changed(w, h); }
+                    local_preview_scale_changed(idx) => { root.local_preview_scale_changed(idx); }
+                    live_compute_target_changed(idx) => { root.live_compute_target_changed(idx); }
+                    bounces_changed(b) => { root.bounces_changed(b); }
+                    exposure_changed(e) => { root.exposure_changed(e); }
+                    inclusion_changed(s) => { root.inclusion_changed(s); }
+                    c_axis_override_changed(enabled) => { root.c_axis_override_changed(enabled); }
+                    c_axis_angles_changed(tilt, azimuth) => { root.c_axis_angles_changed(tilt, azimuth); }
+                    girdle_frosted_changed(frosted) => { root.girdle_frosted_changed(frosted); }
+                    edge_rounding_changed(r) => { root.edge_rounding_changed(r); }
+                    stone_width_changed(w) => { root.stone_width_changed(w); }
+                    load_env_map(path) => { root.load_env_map(path); }
+                    pick_hdr_file(cur) => { root.pick_hdr_file(cur) }
+                    clear_env_map => { root.clear_env_map(); }
+                    copy_metrics => { root.copy_metrics(); }
+                    copy_curve_data => { root.copy_curve_data(); }
+                    request_tilt_profile_axes => { root.request_tilt_profile_axes(); }
+                    save_custom_material(name, ri, disp, biref, color_idx, crystal_system_idx, optical_character_idx, biaxial_delta_beta_alpha) => {
+                        root.save_custom_material(name, ri, disp, biref, color_idx, crystal_system_idx, optical_character_idx, biaxial_delta_beta_alpha);
+                    }
+                    delete_custom_material(name) => {
+                        root.delete_custom_material(name);
+                    }
+                    pause_toggled(paused) => { root.pause_toggled(paused); }
+                    save_lighting_preset(name) => { root.save_lighting_preset(name); }
+                    apply_lighting_preset(idx) => { root.apply_lighting_preset(idx); }
+                    rename_lighting_preset(idx, name) => { root.rename_lighting_preset(idx, name); }
+                    delete_lighting_preset(idx) => { root.delete_lighting_preset(idx); }
+                    start_export(w, h, spp, cs, ct) => { root.start_export(w, h, spp, cs, ct); }
+                    cancel_export => { root.cancel_export(); }
+                    check_remote_availability => { root.check_remote_availability(); }
+                }
+
+                // Tab 1: Cutting Schedule Table
+                if root.active_tab == 1: CuttingTableView {
+                    angles: root.current_angles;
+                    copy_row(idx) => { root.copy_cutting_row(idx); }
+                    copy_table => { root.copy_cutting_table(); }
+                }
+
+                // Tab 2: Attached Files & GemCAD downloads
+                if root.active_tab == 2: AttachmentsView {
+                    files: root.current_files;
+                    export_file(name) => { root.export_file(name); }
+                    copy_file_url(url) => { root.copy_text(url); }
+                }
+            }
+        }
+    }
+
+    // --- MODAL METADATA EDITOR DIALOG ---
+    // Pre-filled from `current_detail`/the shape picker's own already-computed option
+    // list (`shape_picker_options`/`shape_picker_current_index` -- see
+    // `library::build_shape_picker_options`) every time it opens: `if` conditionally
+    // instantiates (destroys/recreates), so these bindings are evaluated fresh on each
+    // open rather than only once at startup.
+    if root.metadata_editor_open: MetadataEditorDialog {
+        width: 100%;
+        height: 100%;
+        z: 400;
+        title_draft: root.current_detail.title;
+        designer_draft: root.current_detail.designer;
+        shape_options: root.shape_picker_options;
+        shape_index: root.shape_picker_current_index;
+        shape_draft: root.current_detail.shape;
+        ri_draft: root.current_detail.ri;
+        gear_draft: root.current_detail.gear;
+        facets_draft: root.current_detail.facets;
+        symmetry_order_draft: root.current_detail.symmetry_order;
+        mirror_symmetry_draft: root.current_detail.mirror_symmetry;
+        lw_ratio_draft: root.current_detail.lw_ratio;
+        hw_ratio_draft: root.current_detail.hw_ratio;
+        cw_ratio_draft: root.current_detail.cw_ratio;
+        pw_ratio_draft: root.current_detail.pw_ratio;
+        volume_draft: root.current_detail.volume;
+
+        close => { root.metadata_editor_open = false; }
+        save(title, designer, shape, ri, gear, facets, symmetry_order, mirror_symmetry, lw_ratio, hw_ratio, cw_ratio, pw_ratio, volume) => {
+            root.save_metadata(title, designer, shape, ri, gear, facets, symmetry_order, mirror_symmetry, lw_ratio, hw_ratio, cw_ratio, pw_ratio, volume);
+            root.metadata_editor_open = false;
+        }
+    }
+
+    // 3. FLOATING COMPACT TOAST NOTIFICATION
+    Toast {
+        x: (parent.width - self.width) / 2;
+        y: parent.height - self.height - 24px;
+        text: root.toast_message;
+        is_visible: root.toast_visible;
+        toast_type: root.toast_type;
+
+        dismiss => {
+            root.toast_visible = false;
+        }
+    }
+}
