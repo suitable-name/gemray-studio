@@ -138,8 +138,7 @@ All of the following are **off by default**.
 | `apps/gemray-worker` | `gpu` | Implies `worker`. Routes `render`/`serve` tracing through `gemray`'s GPU megakernel, falling back to the CPU tracer whenever it declines. |
 
 ## Screenshots
-
-...
+<img width="100%" alt="main" src="https://github.com/user-attachments/assets/f214e61d-2481-4411-a731-76a01397b16f" />
 
 ## The design library is yours to build
 
